@@ -50,6 +50,18 @@ LIMIT 10;
 
 No special syntax required — the optimizer automatically detects `WHERE` + `ORDER BY distance` + `LIMIT` patterns and uses filtered HNSW search.
 
+Prepared statements work for parameterized query vectors:
+```sql
+PREPARE search AS SELECT * FROM my_table
+WHERE category = $2
+ORDER BY array_distance(vec, $1::FLOAT[3])
+LIMIT 10;
+
+EXECUTE search([1,2,3], 'X');
+```
+
+> **Note:** Subquery query vectors (`ORDER BY distance(vec, (SELECT q FROM ...))`) currently fall back to sequential scan. Use prepared statements or literal vectors instead.
+
 ### Configuration
 
 ```sql
