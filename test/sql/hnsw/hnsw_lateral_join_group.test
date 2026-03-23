@@ -1,7 +1,7 @@
 # name: test/sql/hnsw/hnsw_lateral_join_group.test
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 statement ok
 SELECT setseed(0.1337);

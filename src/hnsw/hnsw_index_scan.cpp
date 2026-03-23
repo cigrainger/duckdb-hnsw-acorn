@@ -2,22 +2,41 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
 namespace duckdb {
+
+void ExtractFiltersIntoBind(DuckTableEntry &duck_table, LogicalGet &get, HNSWIndexScanBindData &bind_data) {
+	if (get.table_filters.filters.empty()) {
+		return;
+	}
+	idx_t scan_pos = 0;
+	unordered_map<idx_t, idx_t> key_remap;
+	for (const auto &entry : get.table_filters.filters) {
+		auto table_col_idx = entry.first;
+		auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
+		bind_data.filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
+		bind_data.filter_scan_types.push_back(col.GetType());
+		key_remap[table_col_idx] = scan_pos++;
+	}
+	for (auto &entry : get.table_filters.filters) {
+		bind_data.table_filters.filters[key_remap[entry.first]] = entry.second->Copy();
+	}
+	get.table_filters.filters.clear();
+}
 
 BindInfo HNSWIndexScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<HNSWIndexScanBindData>();
@@ -64,8 +83,57 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	local_storage.InitializeScan(bind_data.table.GetStorage(), result->local_storage_state.local_state, input.filters);
 
 	// Initialize the scan state for the index
-	result->index_state =
-	    bind_data.index.Cast<HNSWIndex>().InitializeScan(bind_data.query.get(), bind_data.limit, context);
+	auto &hnsw_index = bind_data.index.Cast<HNSWIndex>();
+
+	if (bind_data.HasFilters()) {
+		// Build a filter bitset by scanning the table with the filter predicates
+		auto &data_table = bind_data.table.GetStorage();
+		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+
+		// Build scan column IDs: filter columns + ROW_ID (last).
+		auto filter_scan_col_ids = bind_data.filter_scan_column_ids;
+		auto filter_scan_types = bind_data.filter_scan_types;
+		filter_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+		filter_scan_types.push_back(LogicalType::ROW_TYPE);
+
+		// Pass table filters to InitializeScan so DuckDB uses zone maps to skip
+		// non-matching row groups and evaluates filters per-row natively.
+		// This avoids a full table scan — only matching rows are returned.
+		TableScanState scan_state;
+		scan_state.Initialize(filter_scan_col_ids);
+		data_table.InitializeScan(context, transaction, scan_state, filter_scan_col_ids, &bind_data.table_filters);
+
+		auto total_rows = data_table.GetTotalRows();
+		vector<uint64_t> filter_bitset((total_rows / 64) + 1, 0);
+
+		DataChunk scan_chunk;
+		scan_chunk.Initialize(context, filter_scan_types);
+
+		// ROW_ID is the last column. All rows returned by Scan already
+		// pass the filter — just collect their row_ids into the bitset.
+		auto row_id_col_idx = filter_scan_types.size() - 1;
+		while (true) {
+			scan_chunk.Reset();
+			data_table.Scan(transaction, scan_chunk, scan_state);
+			if (scan_chunk.size() == 0) {
+				break;
+			}
+			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
+			for (idx_t i = 0; i < scan_chunk.size(); i++) {
+				auto rid = static_cast<idx_t>(row_id_data[i]);
+				auto word = rid / 64;
+				if (word >= filter_bitset.size()) {
+					filter_bitset.resize(word + 1, 0);
+				}
+				filter_bitset[word] |= (1ULL << (rid % 64));
+			}
+		}
+
+		result->index_state = hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit,
+		                                                        std::move(filter_bitset), context);
+	} else {
+		result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), bind_data.limit, context);
+	}
 
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(result);

@@ -1,9 +1,76 @@
+# DuckDB-HNSW-ACORN
+
+> **This is a fork of [duckdb/duckdb-vss](https://github.com/duckdb/duckdb-vss) that adds ACORN-1 filtered HNSW search.**
+>
+> The upstream extension has a critical limitation: `WHERE` clauses are applied *after* the HNSW index returns results, so `SELECT ... WHERE category = 'X' ORDER BY distance LIMIT 10` often returns fewer than 10 rows. This fork pushes filter predicates *into* the HNSW graph traversal using the [ACORN-1 algorithm](https://arxiv.org/abs/2403.04871), ensuring filtered queries return the correct number of results with high recall.
+>
+> **What changed:**
+> - Filter predicates are evaluated during HNSW graph traversal, not after
+> - ACORN-1 two-hop expansion through failed neighbors recovers graph connectivity under selective filtering
+> - Selectivity-based strategy switching: >60% selectivity uses post-filter, 1-60% uses ACORN-1, <1% uses brute-force exact scan
+> - Per-node expansion threshold (Lucene's 90% rule) skips two-hop when the neighborhood is already well-connected
+> - Configurable thresholds: `SET hnsw_acorn_threshold = 0.6` and `SET hnsw_bruteforce_threshold = 0.01`
+>
+> **Benchmark (228k movies, 768-dim Nomic embeddings):**
+> | Filter | Selectivity | Upstream | ACORN-1 |
+> |---|---|---|---|
+> | English only | ~60% | ~10/10 | **10/10** |
+> | Japanese only | ~3% | 0-1/10 | **10/10** |
+> | Korean only | ~1% | 0/10 | **10/10** |
+> | Rating >= 8.0 | ~5% | 0/10 | **10/10** |
+>
+> Query: movies similar to *The Matrix*, filtered by language → returns *Matrix Revolutions*, *Gunhed* (ja), *Savior of the Earth* (ko).
+> See [`test/benchmark/movies_real_benchmark.sql`](test/benchmark/movies_real_benchmark.sql) for the full benchmark.
+
+---
+
+*Original README follows.*
+
+---
+
 # DuckDB-VSS
 
 Vector Similarity Search for DuckDB
 
-This is an experimental extension for DuckDB that adds indexing support to accelerate Vector Similarity Search using DuckDB's new fixed-size `ARRAY` type added in version v0.10.0. 
+This is an experimental extension for DuckDB that adds indexing support to accelerate Vector Similarity Search using DuckDB's new fixed-size `ARRAY` type added in version v0.10.0.
 This extension is based on the [usearch](https://github.com/unum-cloud/usearch) library and serves as a proof of concept for providing a custom index type, in this case a HNSW index, from within an extension and exposing it to DuckDB.
+
+## Filtered Search (ACORN-1)
+
+This fork adds support for filtered vector search. Queries with `WHERE` clauses now push filter predicates into the HNSW index traversal:
+
+```sql
+-- This now returns exactly 10 results with category = 'X',
+-- ordered by distance. Upstream would return 0-2 results.
+SELECT * FROM my_table
+WHERE category = 'X'
+ORDER BY array_distance(vec, [1,2,3]::FLOAT[3])
+LIMIT 10;
+```
+
+No special syntax required — the optimizer automatically detects `WHERE` + `ORDER BY distance` + `LIMIT` patterns and uses filtered HNSW search.
+
+Prepared statements work for parameterized query vectors:
+```sql
+PREPARE search AS SELECT * FROM my_table
+WHERE category = $2
+ORDER BY array_distance(vec, $1::FLOAT[3])
+LIMIT 10;
+
+EXECUTE search([1,2,3], 'X');
+```
+
+> **Note:** Subquery query vectors (`ORDER BY distance(vec, (SELECT q FROM ...))`) currently fall back to sequential scan. Use prepared statements or literal vectors instead.
+
+### Configuration
+
+```sql
+-- Selectivity above which ACORN-1 is skipped (default 0.6 = 60%)
+SET hnsw_acorn_threshold = 0.6;
+
+-- Selectivity below which brute-force exact scan is used (default 0.01 = 1%)
+SET hnsw_bruteforce_threshold = 0.01;
+```
 
 ## Usage
 

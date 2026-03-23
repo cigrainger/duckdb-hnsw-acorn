@@ -1,11 +1,15 @@
 #pragma once
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/function/function.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/storage_index.hpp"
 
 namespace duckdb {
 
@@ -27,15 +31,35 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 	//! The query vector
 	unsafe_unique_array<float> query;
 
+	//! Optional: table filters to push into the index scan (for filtered search).
+	//! Mutable because the DuckDB scan API takes non-const optional_ptr<TableFilterSet>.
+	mutable TableFilterSet table_filters;
+
+	//! Column IDs for the filter scan. Includes all columns needed by filters
+	//! (in positions matching the filter keys) plus ROW_ID at the end.
+	vector<StorageIndex> filter_scan_column_ids;
+
+	//! Types for the filter scan columns (matching filter_scan_column_ids).
+	vector<LogicalType> filter_scan_types;
+
 public:
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<HNSWIndexScanBindData>();
 		return &other.table == &table;
+	}
+
+	bool HasFilters() const {
+		return !table_filters.filters.empty();
 	}
 };
 
 struct HNSWIndexScanFunction {
 	static TableFunction GetFunction();
 };
+
+//! Extract table filters from a LogicalGet into HNSWIndexScanBindData.
+//! Remaps filter keys from table column indices to storage column OIDs
+//! and clears the GET's table_filters.
+void ExtractFiltersIntoBind(DuckTableEntry &duck_table, LogicalGet &get, HNSWIndexScanBindData &bind_data);
 
 } // namespace duckdb

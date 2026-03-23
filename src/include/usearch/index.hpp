@@ -2930,6 +2930,60 @@ public:
 	}
 
 	/**
+	 *  @brief  ACORN-1 filtered search. Same as search() but uses two-hop expansion
+	 *          on the base layer for better recall under selective predicates.
+	 */
+	template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at = dummy_prefetch_t>
+	search_result_t search_acorn1(                  //
+	    value_at &&query,                           //
+	    std::size_t wanted,                         //
+	    metric_at &&metric,                         //
+	    index_search_config_t config = {},          //
+	    predicate_at &&predicate = predicate_at {}, //
+	    prefetch_at &&prefetch = prefetch_at {}) const usearch_noexcept_m {
+
+		if (!wanted)
+			return search_result_t {};
+		if (!config.expansion)
+			config.expansion = default_expansion_search();
+
+		context_t &context = contexts_[config.thread];
+		top_candidates_t &top = context.top_candidates;
+		search_result_t result {*this, top};
+		if (!nodes_count_)
+			return result;
+
+		result.computed_distances = context.computed_distances_count;
+		result.visited_members = context.iteration_cycles;
+
+		if (config.exact) {
+			if (!top.reserve(wanted))
+				return result.failed("Out of memory!");
+			search_exact_(query, metric, predicate, wanted, context);
+		} else {
+			next_candidates_t &next = context.next_candidates;
+			std::size_t expansion = (std::max)(config.expansion, wanted);
+			if (!next.reserve(expansion))
+				return result.failed("Out of memory!");
+			if (!top.reserve(expansion))
+				return result.failed("Out of memory!");
+
+			std::size_t closest_slot = search_for_one_(query, metric, prefetch, entry_slot_, max_level_, 0, context);
+
+			if (!search_to_find_in_base_acorn1_(query, metric, predicate, prefetch, closest_slot, expansion, context))
+				return result.failed("Out of memory!");
+		}
+
+		top.sort_ascending();
+		top.shrink(wanted);
+
+		result.computed_distances = context.computed_distances_count - result.computed_distances;
+		result.visited_members = context.iteration_cycles - result.visited_members;
+		result.count = top.size();
+		return result;
+	}
+
+	/**
 	 *  @brief Identifies the closest cluster to the given ::query. Thread-safe.
 	 *
 	 *  @param[in] query Content that will be compared against other entries in the index.
@@ -3990,6 +4044,133 @@ private:
 					    predicate(member_cref_t {node_at_(successor_slot).ckey(), successor_slot}))
 						top.insert({successor_dist, successor_slot}, top_limit);
 					radius = top.top().distance;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 *  @brief  ACORN-1 filtered search on the base layer.
+	 *
+	 *  Identical to search_to_find_in_base_ except: when a neighbor FAILS the predicate,
+	 *  its own neighbors (two-hop) are explored to find predicate-satisfying nodes that
+	 *  are geometrically close. This recovers graph connectivity under selective filtering.
+	 *
+	 *  Based on: "ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings
+	 *  and Structured Data" (arXiv:2403.04871), with the conditional expansion optimization
+	 *  from Weaviate (only expand when the first-hop neighbor fails the predicate).
+	 */
+	template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at>
+	bool search_to_find_in_base_acorn1_(                                                        //
+	    value_at &&query, metric_at &&metric, predicate_at &&predicate, prefetch_at &&prefetch, //
+	    std::size_t start_slot, std::size_t expansion, context_t &context) const usearch_noexcept_m {
+
+		visits_hash_set_t &visits = context.visits;
+		next_candidates_t &next = context.next_candidates;
+		top_candidates_t &top = context.top_candidates;
+		std::size_t const top_limit = expansion;
+
+		visits.clear();
+		next.clear();
+		top.clear();
+		if (!visits.reserve(config_.connectivity_base + 1u))
+			return false;
+
+		if (!is_dummy<prefetch_at>())
+			prefetch(citerator_at(start_slot), citerator_at(start_slot + 1));
+
+		distance_t radius = context.measure(query, citerator_at(start_slot), metric);
+		next.insert_reserved({-radius, static_cast<compressed_slot_t>(start_slot)});
+		visits.set(static_cast<compressed_slot_t>(start_slot));
+
+		if (is_dummy<predicate_at>() || predicate(member_cref_t {node_at_(start_slot).ckey(), start_slot}))
+			top.insert_reserved({radius, static_cast<compressed_slot_t>(start_slot)});
+
+		while (!next.empty()) {
+			candidate_t candidate = next.top();
+			if ((-candidate.distance) > radius && top.size() >= top_limit)
+				break;
+
+			next.pop();
+			context.iteration_cycles++;
+
+			neighbors_ref_t candidate_neighbors = neighbors_base_(node_at_(candidate.slot));
+
+			if (!is_dummy<prefetch_at>()) {
+				candidates_range_t missing_candidates {*this, candidate_neighbors, visits};
+				prefetch(missing_candidates.begin(), missing_candidates.end());
+			}
+
+			if (!visits.reserve(visits.size() + candidate_neighbors.size()))
+				return false;
+
+			// Track pass/fail ratio for per-node expansion threshold.
+			// If >=90% of neighbors pass the predicate, the neighborhood is
+			// well-connected and two-hop expansion is unnecessary overhead.
+			std::size_t neighbors_checked = 0;
+			std::size_t neighbors_passing = 0;
+
+			for (compressed_slot_t successor_slot : candidate_neighbors) {
+				if (visits.set(successor_slot))
+					continue;
+
+				distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
+				if (top.size() < top_limit || successor_dist < radius) {
+					next.insert({-successor_dist, successor_slot});
+
+					bool passes = is_dummy<predicate_at>() ||
+					              predicate(member_cref_t {node_at_(successor_slot).ckey(), successor_slot});
+
+					neighbors_checked++;
+					if (passes) {
+						neighbors_passing++;
+						top.insert({successor_dist, successor_slot}, top_limit);
+					} else if (neighbors_checked < 2 || neighbors_passing * 10 < neighbors_checked * 9) {
+						// ACORN-1: two-hop expansion through failed neighbor.
+						// Skip if >=90% of checked neighbors pass (Lucene's threshold).
+						neighbors_ref_t two_hop = neighbors_base_(node_at_(successor_slot));
+
+						if (!visits.reserve(visits.size() + two_hop.size()))
+							return false;
+
+						for (compressed_slot_t th_slot : two_hop) {
+							if (visits.set(th_slot))
+								continue;
+
+							distance_t th_dist = context.measure(query, citerator_at(th_slot), metric);
+							if (top.size() < top_limit || th_dist < radius) {
+								next.insert({-th_dist, th_slot});
+								bool th_passes = is_dummy<predicate_at>() ||
+								                 predicate(member_cref_t {node_at_(th_slot).ckey(), th_slot});
+								if (th_passes) {
+									top.insert({th_dist, th_slot}, top_limit);
+								} else if (top.size() < top_limit / 2) {
+									// Three-hop: expand when top is less than half full
+									// (very low selectivity). Capped by visits set.
+									neighbors_ref_t three_hop = neighbors_base_(node_at_(th_slot));
+									if (visits.reserve(visits.size() + three_hop.size())) {
+										for (compressed_slot_t tri_slot : three_hop) {
+											if (visits.set(tri_slot))
+												continue;
+											distance_t tri_dist =
+											    context.measure(query, citerator_at(tri_slot), metric);
+											if (top.size() < top_limit || tri_dist < radius) {
+												next.insert({-tri_dist, tri_slot});
+												if (is_dummy<predicate_at>() ||
+												    predicate(member_cref_t {node_at_(tri_slot).ckey(), tri_slot}))
+													top.insert({tri_dist, tri_slot}, top_limit);
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					// Update radius after any top changes (both pass and fail paths)
+					if (top.size() >= top_limit)
+						radius = top.top().distance;
 				}
 			}
 		}

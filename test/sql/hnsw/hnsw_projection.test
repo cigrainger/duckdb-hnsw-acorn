@@ -1,7 +1,7 @@
 # name: test/sql/hnsw/hnsw_projection.test
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 require noforcestorage
 

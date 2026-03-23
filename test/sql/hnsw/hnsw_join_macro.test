@@ -1,7 +1,7 @@
 # name: test/sql/hnsw/hnsw_join_macro.test
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 statement ok
 CREATE TABLE t1 (id int, vec FLOAT[3]);

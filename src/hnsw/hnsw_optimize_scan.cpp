@@ -2,16 +2,15 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
@@ -67,12 +66,26 @@ public:
 		const auto projection_index = bound_column_ref.binding.column_index;
 		const auto &projection_expr = projection.expressions[projection_index];
 
-		// The projection must sit on top of a get
-		if (projection.children.size() != 1 || projection.children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+		// The projection must sit on top of a get (or a filter on top of a get)
+		if (projection.children.size() != 1) {
 			return false;
 		}
 
-		auto &get_ptr = projection.children.front();
+		unique_ptr<LogicalOperator> *get_ptr_ref = &projection.children.front();
+		LogicalFilter *logical_filter = nullptr;
+
+		if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_FILTER) {
+			logical_filter = &(*get_ptr_ref)->Cast<LogicalFilter>();
+			if (logical_filter->children.size() != 1 ||
+			    logical_filter->children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+				return false;
+			}
+			get_ptr_ref = &logical_filter->children.front();
+		} else if ((*get_ptr_ref)->type != LogicalOperatorType::LOGICAL_GET) {
+			return false;
+		}
+
+		auto &get_ptr = *get_ptr_ref;
 		auto &get = get_ptr->Cast<LogicalGet>();
 		// Check if the get is a table scan
 		if (get.function.name != "seq_scan") {
@@ -102,9 +115,9 @@ public:
 		vector<reference<Expression>> bindings;
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		table_info.GetIndexes().Scan([&](Index &index) {
+		for (auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
-				return false;
+				continue;
 			}
 			auto &cast_index = index.Cast<HNSWIndex>();
 
@@ -113,12 +126,12 @@ public:
 
 			// Check that the projection expression is a distance function that matches the index
 			if (!cast_index.TryMatchDistanceFunction(projection_expr, bindings)) {
-				return false;
+				continue;
 			}
 			// Check that the HNSW index actually indexes the expression
 			unique_ptr<Expression> index_expr;
 			if (!cast_index.TryBindIndexExpression(get, index_expr)) {
-				return false;
+				continue;
 			}
 
 			// Now, ensure that one of the bindings is a constant vector, and the other our index expression
@@ -131,7 +144,7 @@ public:
 				if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT ||
 				    !index_expr->Equals(index_expr_ref)) {
 					// Nope, not a match, we can't optimize.
-					return false;
+					continue;
 				}
 			}
 
@@ -144,40 +157,40 @@ public:
 			}
 
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, top_n.limit, std::move(query_vector));
-			return true;
-		});
+			break;
+		}
 
 		if (!bind_data) {
 			// No index found
 			return false;
 		}
 
-		// If there are no table filters pushed down into the get, we can just replace the get with the index scan
+		// Push table filters into the bind data for filtered HNSW search
+		ExtractFiltersIntoBind(duck_table, get, *bind_data);
+
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.function = HNSWIndexScanFunction::GetFunction();
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 		if (get.table_filters.filters.empty()) {
-
-			// Remove the TopN operator
+			// No filters — just remove TopN
 			plan = std::move(top_n.children[0]);
 			return true;
 		}
 
-		// Otherwise, things get more complicated. We need to pullup the filters from the table scan as our index scan
-		// does not support regular filter pushdown.
+		// Pull up the filters as a LogicalFilter node (keeps plan structure intact)
 		get.projection_ids.clear();
 		get.types.clear();
 
 		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
+		auto &get_column_ids = get.GetColumnIds();
 		for (const auto &entry : get.table_filters.filters) {
 			idx_t column_id = entry.first;
 			auto &type = get.returned_types[column_id];
 			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
+			for (idx_t i = 0; i < get_column_ids.size(); i++) {
+				if (get_column_ids[i].GetPrimaryIndex() == column_id) {
 					column_id = i;
 					found = true;
 					break;
@@ -261,7 +274,7 @@ public:
 //-----------------------------------------------------------------------------
 void HNSWModule::RegisterScanOptimizer(DatabaseInstance &db) {
 	// Register the optimizer extension
-	db.config.optimizer_extensions.push_back(HNSWIndexScanOptimizer());
+	OptimizerExtension::Register(db.config, HNSWIndexScanOptimizer());
 }
 
 } // namespace duckdb

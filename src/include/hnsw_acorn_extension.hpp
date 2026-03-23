@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class VssExtension : public Extension {
+class HnswAcornExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;

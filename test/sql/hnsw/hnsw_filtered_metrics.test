@@ -1,0 +1,90 @@
+# name: test/sql/hnsw/hnsw_filtered_metrics.test
+# description: Test filtered HNSW search with all distance metrics
+# group: [hnsw]
+
+require hnsw_acorn
+
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+# ------------------------------------------------------------------
+# L2 squared (default)
+# ------------------------------------------------------------------
+statement ok
+CREATE INDEX idx_l2 ON items USING HNSW (vec) WITH (metric = 'l2sq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 2
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 2;
+----
+0
+
+statement ok
+DROP INDEX idx_l2;
+
+# ------------------------------------------------------------------
+# Cosine distance
+# ------------------------------------------------------------------
+statement ok
+CREATE INDEX idx_cos ON items USING HNSW (vec) WITH (metric = 'cosine');
+
+# Verify index is used
+query II
+EXPLAIN SELECT * FROM items WHERE category = 3
+ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# All results satisfy filter
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 3
+    ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 3;
+----
+0
+
+# Also works with the <=> operator
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 4
+    ORDER BY vec <=> [1.0, 2.0, 3.0]::FLOAT[3] LIMIT 10
+) sub WHERE sub.category != 4;
+----
+0
+
+statement ok
+DROP INDEX idx_cos;
+
+# ------------------------------------------------------------------
+# Inner product
+# ------------------------------------------------------------------
+statement ok
+CREATE INDEX idx_ip ON items USING HNSW (vec) WITH (metric = 'ip');
+
+# All results satisfy filter
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 0;
+----
+0
+
+# Also works with different filter values
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_negative_inner_product(vec, [5.0, 6.0, 7.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+statement ok
+DROP INDEX idx_ip;

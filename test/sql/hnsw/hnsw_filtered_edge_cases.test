@@ -1,0 +1,102 @@
+# name: test/sql/hnsw/hnsw_filtered_edge_cases.test
+# description: Edge cases for filtered HNSW search
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+# ------------------------------------------------------------------
+# Edge case: filter matches ALL rows (selectivity = 100%)
+# Should use standard HNSW (above acorn_threshold) and return results
+# ------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category >= 0
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# ------------------------------------------------------------------
+# Edge case: filter matches NO rows (selectivity = 0%)
+# ------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 99
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+0
+
+# ------------------------------------------------------------------
+# Edge case: LIMIT larger than matching rows
+# ------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE id = 42
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 100
+);
+----
+1
+
+# ------------------------------------------------------------------
+# Edge case: empty table
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE empty_t (id INTEGER, vec FLOAT[3], cat INTEGER);
+
+statement ok
+CREATE INDEX empty_idx ON empty_t USING HNSW (vec);
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM empty_t WHERE cat = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+0
+
+# ------------------------------------------------------------------
+# Edge case: very selective filter (single row match)
+# ------------------------------------------------------------------
+query I
+SELECT id FROM items WHERE id = 250
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5;
+----
+250
+
+# ------------------------------------------------------------------
+# Subquery query vector falls back to seq scan (documented limitation)
+# Should still return correct results, just not via HNSW index
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE qvec AS SELECT vec AS q FROM items WHERE id = 0;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_distance(vec, (SELECT q FROM qvec)) LIMIT 10
+);
+----
+10
+
+# ------------------------------------------------------------------
+# TopK optimizer: MIN_BY with filter
+# ------------------------------------------------------------------
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5))
+FROM items WHERE category = 1;
+----
+5

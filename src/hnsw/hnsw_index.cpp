@@ -340,6 +340,106 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 	return std::move(state);
 }
 
+unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector, idx_t limit,
+                                                             vector<uint64_t> filter_bitset, ClientContext &context) {
+	auto state = make_uniq<HNSWIndexScanState>();
+
+	// Get ef_search parameter
+	auto ef_search = index.expansion_search();
+	Value hnsw_ef_search_opt;
+	if (context.TryGetCurrentSetting("hnsw_ef_search", hnsw_ef_search_opt)) {
+		if (!hnsw_ef_search_opt.IsNull() && hnsw_ef_search_opt.type() == LogicalType::BIGINT) {
+			auto val = hnsw_ef_search_opt.GetValue<int64_t>();
+			if (val > 0) {
+				ef_search = static_cast<idx_t>(val);
+			}
+		}
+	}
+
+	// Compute selectivity from bitset
+	idx_t popcount = 0;
+	for (auto &w : filter_bitset) {
+		// Portable popcount: works on GCC, Clang, and MSVC
+#if defined(__GNUC__) || defined(__clang__)
+		popcount += __builtin_popcountll(w);
+#elif defined(_MSC_VER)
+		popcount += __popcnt64(w);
+#else
+		auto v = w;
+		while (v) {
+			popcount++;
+			v &= v - 1;
+		}
+#endif
+	}
+	// Use index size as denominator — matches the keys the predicate will be checked against.
+	// Clamp to [0, 1] since popcount (from table scan) and index.size() can diverge after deletes.
+	auto total = index.size();
+	float selectivity = total > 0 ? static_cast<float>(popcount) / static_cast<float>(total) : 0.0f;
+	if (selectivity > 1.0f) {
+		selectivity = 1.0f;
+	}
+
+	// Get selectivity thresholds (configurable via SET)
+	float acorn_threshold = 0.6f;
+	float bruteforce_threshold = 0.01f;
+
+	Value acorn_thresh_opt;
+	if (context.TryGetCurrentSetting("hnsw_acorn_threshold", acorn_thresh_opt)) {
+		if (!acorn_thresh_opt.IsNull()) {
+			acorn_threshold = acorn_thresh_opt.GetValue<float>();
+		}
+	}
+	Value bf_thresh_opt;
+	if (context.TryGetCurrentSetting("hnsw_bruteforce_threshold", bf_thresh_opt)) {
+		if (!bf_thresh_opt.IsNull()) {
+			bruteforce_threshold = bf_thresh_opt.GetValue<float>();
+		}
+	}
+
+	// Build predicate from filter bitset (owned by this function via move).
+	// LIFETIME: captures filter_bitset by reference. Safe because
+	// ef_acorn1_filtered_search executes synchronously — the predicate
+	// does not outlive this function scope.
+	auto predicate = [&filter_bitset](row_t key) -> bool {
+		auto word = static_cast<idx_t>(key) / 64;
+		auto bit = static_cast<idx_t>(key) % 64;
+		return word < filter_bitset.size() && (filter_bitset[word] & (1ULL << bit)) != 0;
+	};
+
+	// Auto-tune ef_search for filtered search: at low selectivity, the search
+	// needs to explore more candidates to find enough matching rows.
+	// Scale inversely with selectivity, capped at index size.
+	if (selectivity > 0.0f && selectivity < 1.0f) {
+		auto needed = static_cast<idx_t>(static_cast<float>(limit * 2) / selectivity);
+		if (needed > ef_search) {
+			ef_search = (needed < index.size()) ? needed : static_cast<idx_t>(index.size());
+		}
+	}
+
+	auto lock = rwlock.GetSharedLock();
+
+	USearchIndexType::search_result_t search_result;
+	if (selectivity > acorn_threshold) {
+		// High selectivity: standard HNSW search (post-filter handles the rest)
+		search_result = index.ef_search(query_vector, limit, ef_search);
+	} else if (popcount > 0 && selectivity < bruteforce_threshold) {
+		// Very low selectivity: brute-force exact scan over all matching rows
+		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate,
+		                                                /*thread=*/0, /*exact=*/true);
+	} else {
+		// Medium selectivity: ACORN-1 filtered search with two-hop expansion
+		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
+	}
+
+	state->current_row = 0;
+	state->total_rows = search_result.size();
+	state->row_ids = make_uniq_array<row_t>(search_result.size());
+
+	search_result.dump_to(state->row_ids.get());
+	return std::move(state);
+}
+
 idx_t HNSWIndex::Scan(IndexScanState &state, Vector &result, idx_t result_offset) {
 	auto &scan_state = state.Cast<HNSWIndexScanState>();
 
@@ -596,8 +696,12 @@ bool HNSWIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 void HNSWIndex::Vacuum(IndexLock &state) {
 }
 
-string HNSWIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
-	throw NotImplementedException("HNSWIndex::VerifyAndToString() not implemented");
+void HNSWIndex::Verify(IndexLock &l) {
+	// No-op: HNSW index verification not implemented
+}
+
+string HNSWIndex::ToString(IndexLock &l, bool display_ascii) {
+	return StringUtil::Format("HNSW Index [%s] (%llu entries)", GetIndexName(), index.size());
 }
 
 void HNSWIndex::VerifyAllocations(IndexLock &state) {
@@ -693,7 +797,6 @@ void HNSWIndex::VerifyBuffers(IndexLock &lock) {
 	linked_block_allocator->VerifyBuffers();
 }
 
-
 //------------------------------------------------------------------------------
 // Register Index Type
 //------------------------------------------------------------------------------
@@ -714,10 +817,18 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	                             "experimental: enable creating HNSW indexes in persistent databases",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// Register scan option
+	// Register scan options
 	db.config.AddExtensionOption("hnsw_ef_search",
 	                             "experimental: override the ef_search parameter when scanning HNSW indexes",
 	                             LogicalType::BIGINT);
+
+	// ACORN-1 filtered search thresholds
+	db.config.AddExtensionOption(
+	    "hnsw_acorn_threshold", "selectivity above which ACORN-1 is skipped (standard HNSW + post-filter used instead)",
+	    LogicalType::FLOAT, Value::FLOAT(0.6f));
+	db.config.AddExtensionOption("hnsw_bruteforce_threshold",
+	                             "selectivity below which brute-force exact scan is used instead of ACORN-1",
+	                             LogicalType::FLOAT, Value::FLOAT(0.01f));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

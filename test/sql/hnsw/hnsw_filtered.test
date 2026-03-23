@@ -1,0 +1,84 @@
+# name: test/sql/hnsw/hnsw_filtered.test
+# description: Test filtered HNSW search correctness
+# group: [hnsw]
+
+# Tests for filtered HNSW search with ACORN-1.
+# Filter predicates are pushed into the HNSW graph traversal via bitset,
+# ensuring filtered queries return the correct number of results.
+
+require hnsw_acorn
+
+# Create a table with vectors and categorical columns for filtering
+statement ok
+CREATE TABLE items AS
+SELECT
+    i AS id,
+    array_value(
+        (i % 10)::FLOAT,
+        ((i * 7) % 13)::FLOAT,
+        ((i * 3) % 17)::FLOAT
+    ) AS vec,
+    (i % 5) AS category,
+    (i % 3) AS region
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX items_idx ON items USING HNSW (vec);
+
+# ------------------------------------------------------------------
+# Baseline: unfiltered search works and uses HNSW index
+# ------------------------------------------------------------------
+query II
+EXPLAIN SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# ------------------------------------------------------------------
+# Filtered search: current behavior returns fewer than LIMIT
+# because filter is applied AFTER the HNSW index scan.
+# HNSW returns top-10 unfiltered, post-filter keeps only matching rows.
+# With 20% selectivity (category has 5 values), expect ~2 of 10 to match.
+# ------------------------------------------------------------------
+
+# Verify the HNSW index IS being used (with post-filter above it)
+query II
+EXPLAIN SELECT * FROM items WHERE category = 1 ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# ------------------------------------------------------------------
+# Verify ALL returned results satisfy the filter predicate
+# (post-filter does work — it just truncates the result count)
+# ------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub
+WHERE sub.category != 1;
+----
+0
+
+# ------------------------------------------------------------------
+# No matches — should return 0 rows, not crash
+# ------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    WHERE category = 99
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+0
