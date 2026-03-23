@@ -66,12 +66,26 @@ public:
 		const auto projection_index = bound_column_ref.binding.column_index;
 		const auto &projection_expr = projection.expressions[projection_index];
 
-		// The projection must sit on top of a get
-		if (projection.children.size() != 1 || projection.children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+		// The projection must sit on top of a get (or a filter on top of a get)
+		if (projection.children.size() != 1) {
 			return false;
 		}
 
-		auto &get_ptr = projection.children.front();
+		unique_ptr<LogicalOperator> *get_ptr_ref = &projection.children.front();
+		LogicalFilter *logical_filter = nullptr;
+
+		if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_FILTER) {
+			logical_filter = &(*get_ptr_ref)->Cast<LogicalFilter>();
+			if (logical_filter->children.size() != 1 ||
+			    logical_filter->children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+				return false;
+			}
+			get_ptr_ref = &logical_filter->children.front();
+		} else if ((*get_ptr_ref)->type != LogicalOperatorType::LOGICAL_GET) {
+			return false;
+		}
+
+		auto &get_ptr = *get_ptr_ref;
 		auto &get = get_ptr->Cast<LogicalGet>();
 		// Check if the get is a table scan
 		if (get.function.name != "seq_scan") {
