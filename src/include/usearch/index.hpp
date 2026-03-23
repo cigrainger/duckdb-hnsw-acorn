@@ -4142,9 +4142,29 @@ private:
 							distance_t th_dist = context.measure(query, citerator_at(th_slot), metric);
 							if (top.size() < top_limit || th_dist < radius) {
 								next.insert({-th_dist, th_slot});
-								if (is_dummy<predicate_at>() ||
-								    predicate(member_cref_t {node_at_(th_slot).ckey(), th_slot}))
+								bool th_passes = is_dummy<predicate_at>() ||
+								                 predicate(member_cref_t {node_at_(th_slot).ckey(), th_slot});
+								if (th_passes) {
 									top.insert({th_dist, th_slot}, top_limit);
+								} else if (top.size() < top_limit / 2) {
+									// Three-hop: expand when top is less than half full
+									// (very low selectivity). Capped by visits set.
+									neighbors_ref_t three_hop = neighbors_base_(node_at_(th_slot));
+									if (visits.reserve(visits.size() + three_hop.size())) {
+										for (compressed_slot_t tri_slot : three_hop) {
+											if (visits.set(tri_slot))
+												continue;
+											distance_t tri_dist =
+											    context.measure(query, citerator_at(tri_slot), metric);
+											if (top.size() < top_limit || tri_dist < radius) {
+												next.insert({-tri_dist, tri_slot});
+												if (is_dummy<predicate_at>() ||
+												    predicate(member_cref_t {node_at_(tri_slot).ckey(), tri_slot}))
+													top.insert({tri_dist, tri_slot}, top_limit);
+											}
+										}
+									}
+								}
 							}
 						}
 					}
