@@ -1,7 +1,7 @@
 -- Real-World Movies Benchmark: 228k rows, 768-dim embeddings, real metadata filters
 -- Run with: ./build/release/duckdb < test/benchmark/movies_real_benchmark.sql
 
-LOAD vss;
+LOAD hnsw_acorn;
 .timer on
 
 .print 'Loading 228k movies with 768-dim embeddings...'

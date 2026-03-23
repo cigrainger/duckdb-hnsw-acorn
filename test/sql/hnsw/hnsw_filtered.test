@@ -2,11 +2,9 @@
 # description: Test filtered HNSW search correctness
 # group: [hnsw]
 
-# This test documents the CURRENT (broken) behavior of filtered search.
-# The HNSW index returns top-k unfiltered, then a post-filter reduces results.
-# Brief 1 (bitset-based filtered search) fixes this.
-# Tests marked with expected counts reflect current post-filter behavior.
-# When Brief 1 lands, update expected counts to match correct behavior.
+# Tests for filtered HNSW search with ACORN-1.
+# Filter predicates are pushed into the HNSW graph traversal via bitset,
+# ensuring filtered queries return the correct number of results.
 
 require hnsw_acorn
 

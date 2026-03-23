@@ -7,7 +7,7 @@
 
 .timer on
 
-LOAD 'build/release/extension/vss/vss.duckdb_extension';
+LOAD hnsw_acorn;
 
 -- ============================================================
 -- Setup: generate synthetic dataset

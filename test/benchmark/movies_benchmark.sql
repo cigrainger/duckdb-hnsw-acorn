@@ -4,7 +4,7 @@
 -- Run with: ./build/release/duckdb < test/benchmark/movies_benchmark.sql
 
 .timer on
-LOAD vss;
+LOAD hnsw_acorn;
 
 .print 'Loading movies dataset...'
 

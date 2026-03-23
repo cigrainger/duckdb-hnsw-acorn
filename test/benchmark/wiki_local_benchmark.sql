@@ -8,7 +8,7 @@
 --      ./build/release/duckdb < test/benchmark/wiki_local_benchmark.sql
 
 .timer on
-LOAD vss;
+LOAD hnsw_acorn;
 
 -- ============================================================
 -- Load from local parquet

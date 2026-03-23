@@ -2,7 +2,7 @@
 -- Run with: ./build/release/duckdb < test/benchmark/words_benchmark.sql
 
 .timer on
-LOAD vss;
+LOAD hnsw_acorn;
 
 .print 'Loading 496k word embeddings (300-dim)...'
 

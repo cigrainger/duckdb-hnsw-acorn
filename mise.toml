@@ -1,2 +1,2 @@
 [tools]
-duckdb = "1.4.3"
+duckdb = "1.5.0"

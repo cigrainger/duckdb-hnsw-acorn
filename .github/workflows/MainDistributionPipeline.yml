@@ -5,13 +5,13 @@ name: Main Extension Distribution Pipeline
 on:
   pull_request:
     branches:
-      - v1.5-variegata
+      - main
     paths-ignore:
       - '**/README.md'
       - 'doc/**'
   push:
     branches:
-      - v1.5-variegata
+      - main
     paths-ignore:
       - '**/README.md'
       - 'doc/**'
@@ -26,8 +26,8 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      extension_name: vss
-      duckdb_version: v1.5-variegata
+      extension_name: hnsw_acorn
+      duckdb_version: v1.5.0
       ci_tools_version: main
 
   duckdb-stable-deploy:
@@ -36,7 +36,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
     secrets: inherit
     with:
-      extension_name: vss
-      duckdb_version: v1.5-variegata
+      extension_name: hnsw_acorn
+      duckdb_version: v1.5.0
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
