@@ -19,6 +19,25 @@
 
 namespace duckdb {
 
+void ExtractFiltersIntoBind(DuckTableEntry &duck_table, LogicalGet &get, HNSWIndexScanBindData &bind_data) {
+	if (get.table_filters.filters.empty()) {
+		return;
+	}
+	idx_t scan_pos = 0;
+	unordered_map<idx_t, idx_t> key_remap;
+	for (const auto &entry : get.table_filters.filters) {
+		auto table_col_idx = entry.first;
+		auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
+		bind_data.filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
+		bind_data.filter_scan_types.push_back(col.GetType());
+		key_remap[table_col_idx] = scan_pos++;
+	}
+	for (auto &entry : get.table_filters.filters) {
+		bind_data.table_filters.filters[key_remap[entry.first]] = entry.second->Copy();
+	}
+	get.table_filters.filters.clear();
+}
+
 BindInfo HNSWIndexScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<HNSWIndexScanBindData>();
 	return BindInfo(bind_data.table);

@@ -372,8 +372,13 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 		}
 #endif
 	}
+	// Use index size as denominator — matches the keys the predicate will be checked against.
+	// Clamp to [0, 1] since popcount (from table scan) and index.size() can diverge after deletes.
 	auto total = index.size();
 	float selectivity = total > 0 ? static_cast<float>(popcount) / static_cast<float>(total) : 0.0f;
+	if (selectivity > 1.0f) {
+		selectivity = 1.0f;
+	}
 
 	// Get selectivity thresholds (configurable via SET)
 	float acorn_threshold = 0.6f;
@@ -695,8 +700,6 @@ void HNSWIndex::Verify(IndexLock &l) {
 string HNSWIndex::ToString(IndexLock &l, bool display_ascii) {
 	return StringUtil::Format("HNSW Index [%s] (%llu entries)", GetIndexName(), index.size());
 }
-
-//! Ensures that the
 
 void HNSWIndex::VerifyAllocations(IndexLock &state) {
 	throw NotImplementedException("HNSWIndex::VerifyAllocations() not implemented");

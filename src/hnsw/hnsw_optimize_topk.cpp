@@ -127,7 +127,7 @@ public:
 		vector<reference<Expression>> bindings;
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
+		for (auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
 				continue;
 			}
@@ -182,23 +182,7 @@ public:
 		}
 
 		// Push table filters into the bind data for filtered HNSW search
-		if (!get.table_filters.filters.empty()) {
-			auto &column_ids = get.GetColumnIds();
-			idx_t scan_pos = 0;
-			unordered_map<idx_t, idx_t> key_remap;
-			for (const auto &entry : get.table_filters.filters) {
-				auto table_col_idx = entry.first;
-				auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
-				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
-				bind_data->filter_scan_types.push_back(col.GetType());
-				key_remap[table_col_idx] = scan_pos++;
-			}
-			for (auto &entry : get.table_filters.filters) {
-				auto new_key = key_remap[entry.first];
-				bind_data->table_filters.filters[new_key] = entry.second->Copy();
-			}
-			get.table_filters.filters.clear();
-		}
+		ExtractFiltersIntoBind(duck_table, get, *bind_data);
 
 		// Replace the aggregate with a index scan + projection
 		get.function = HNSWIndexScanFunction::GetFunction();

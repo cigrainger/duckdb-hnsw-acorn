@@ -115,7 +115,7 @@ public:
 		vector<reference<Expression>> bindings;
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
+		for (auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
 				continue;
 			}
@@ -165,41 +165,8 @@ public:
 			return false;
 		}
 
-		// If there are table filters, set up the filter scan info in the bind data.
-		// Also pull filters up as a LogicalFilter for plan correctness (the filtered
-		// index scan makes the post-filter redundant but the plan structure requires it).
-		if (!get.table_filters.filters.empty()) {
-			// table_filters keys are TABLE column indices (not positions in column_ids).
-			// We need to remap them to storage column indices for our independent scan.
-			// Build scan columns using storage column IDs, and remap filter keys accordingly.
-			auto &column_ids = get.GetColumnIds();
-
-			// For each filter, map the GET position to a storage column index.
-			// Our scan will include these columns in order, so remap filter keys to
-			// new consecutive positions in our scan output.
-			idx_t scan_pos = 0;
-			unordered_map<idx_t, idx_t> key_remap; // old filter key -> new scan position
-			for (const auto &entry : get.table_filters.filters) {
-				// entry.first is the TABLE column index (logical, 0-based).
-				// Convert to storage OID for the scan API — these can diverge
-				// after column-altering operations (ADD/DROP COLUMN).
-				auto table_col_idx = entry.first;
-				auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
-				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
-				bind_data->filter_scan_types.push_back(col.GetType());
-				key_remap[table_col_idx] = scan_pos++;
-			}
-
-			// Copy filters with remapped keys
-			for (auto &entry : get.table_filters.filters) {
-				auto new_key = key_remap[entry.first];
-				bind_data->table_filters.filters[new_key] = entry.second->Copy();
-			}
-
-			// Clear the GET's table_filters — they're now handled by the
-			// filtered index scan. No need to pull them up as a post-filter.
-			get.table_filters.filters.clear();
-		}
+		// Push table filters into the bind data for filtered HNSW search
+		ExtractFiltersIntoBind(duck_table, get, *bind_data);
 
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.function = HNSWIndexScanFunction::GetFunction();

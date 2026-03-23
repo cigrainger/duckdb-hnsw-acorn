@@ -1,11 +1,13 @@
 #pragma once
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_index.hpp"
 
@@ -54,5 +56,10 @@ public:
 struct HNSWIndexScanFunction {
 	static TableFunction GetFunction();
 };
+
+//! Extract table filters from a LogicalGet into HNSWIndexScanBindData.
+//! Remaps filter keys from table column indices to storage column OIDs
+//! and clears the GET's table_filters.
+void ExtractFiltersIntoBind(DuckTableEntry &duck_table, LogicalGet &get, HNSWIndexScanBindData &bind_data);
 
 } // namespace duckdb
