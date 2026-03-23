@@ -367,10 +367,11 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 
 	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	// For filtered search, increase wanted to account for filtering
-	// usearch needs more candidates when many will be filtered out
-	auto wanted = limit > ef_search ? limit : ef_search;
-	auto search_result = index.ef_filtered_search(query_vector, wanted, ef_search, predicate);
+	// Use ACORN-1 search: two-hop expansion through failed neighbors
+	// for better recall under selective predicates.
+	// wanted = limit (how many results to return), ef_search controls
+	// the expansion factor (how many graph nodes to explore).
+	auto search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
 
 	state->current_row = 0;
 	state->total_rows = search_result.size();

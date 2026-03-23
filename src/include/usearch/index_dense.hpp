@@ -631,6 +631,9 @@ class index_dense_gt {
     // Filtered search with custom ef_search (expansion) parameter
     template <typename predicate_at> search_result_t ef_filtered_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, ef_search); }
 
+    // ACORN-1 filtered search: two-hop expansion for better recall under selective predicates
+    template <typename predicate_at> search_result_t ef_acorn1_filtered_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_acorn1_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, ef_search); }
+
     std::size_t get(vector_key_t key, b1x8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_b1x8); }
     std::size_t get(vector_key_t key, i8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_i8); }
     std::size_t get(vector_key_t key, f16_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_f16); }
@@ -1827,6 +1830,31 @@ class index_dense_gt {
             };
             return typed_->search(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
         }
+    }
+
+    template <typename scalar_at, typename predicate_at>
+    search_result_t search_acorn1_(scalar_at const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread,
+                            bool exact, cast_t const& cast, std::size_t expansion_search) const {
+
+        thread_lock_t lock = thread_lock_(thread);
+        byte_t const* vector_data = reinterpret_cast<byte_t const*>(vector);
+        {
+            byte_t* casted_data = cast_buffer_.data() + metric_.bytes_per_vector() * lock.thread_id;
+            bool casted = cast(vector_data, dimensions(), casted_data);
+            if (casted)
+                vector_data = casted_data;
+        }
+
+        index_search_config_t search_config;
+        search_config.thread = lock.thread_id;
+        search_config.expansion = expansion_search;
+        search_config.exact = exact;
+
+        auto &free_key_ = this->free_key_;
+        auto allow = [&free_key_, &predicate](member_cref_t const& member) noexcept {
+            return member.key != free_key_ && predicate(member.key);
+        };
+        return typed_->search_acorn1(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
     }
 
     template <typename scalar_at>
