@@ -167,16 +167,12 @@ public:
 			idx_t scan_pos = 0;
 			unordered_map<idx_t, idx_t> key_remap; // old filter key -> new scan position
 			for (const auto &entry : get.table_filters.filters) {
-				// entry.first is the TABLE column index (not the position in column_ids)
+				// entry.first is the TABLE column index (logical, 0-based)
 				auto table_col_idx = entry.first;
-				auto storage_oid = duck_table.GetColumn(LogicalIndex(table_col_idx)).StorageOid();
-				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(storage_oid));
+				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(table_col_idx));
 				bind_data->filter_scan_types.push_back(duck_table.GetColumn(LogicalIndex(table_col_idx)).GetType());
 				key_remap[table_col_idx] = scan_pos++;
 			}
-			// Add ROW_ID at the end
-			bind_data->filter_scan_column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
-			bind_data->filter_scan_types.push_back(LogicalType::ROW_TYPE);
 
 			// Copy filters with remapped keys
 			for (auto &entry : get.table_filters.filters) {

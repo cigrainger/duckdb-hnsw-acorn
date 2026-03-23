@@ -125,14 +125,8 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		auto &data_table = bind_data.table.GetStorage();
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
 
-		// Use the pre-computed scan column IDs and types from the optimizer.
-		// These are set up so that filter keys match column positions.
-		auto &scan_column_ids = bind_data.filter_scan_column_ids;
-		auto &scan_types = bind_data.filter_scan_types;
-
-		// Scan the table to collect row_ids that pass the filter.
-		// We scan with filter columns + ROW_ID, and manually evaluate
-		// the table filters against each row.
+		// Scan the table with only the filter columns (no ROW_ID — it's not a real column).
+		// Track row index manually; for sequential scans, row index = row_id.
 		auto &filter_scan_col_ids = bind_data.filter_scan_column_ids;
 		auto &filter_scan_types = bind_data.filter_scan_types;
 
@@ -146,9 +140,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		DataChunk scan_chunk;
 		scan_chunk.Initialize(context, filter_scan_types);
 
-		// ROW_ID is the last column in our scan
-		auto row_id_col_idx = filter_scan_types.size() - 1;
-
+		idx_t current_row = 0;
 		while (true) {
 			scan_chunk.Reset();
 			data_table.Scan(transaction, scan_chunk, scan_state);
@@ -156,12 +148,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				break;
 			}
 
-			// Evaluate filters manually against each row
-			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
 			for (idx_t i = 0; i < scan_chunk.size(); i++) {
 				bool passes = true;
 
-				// Evaluate all filters for this row
 				for (const auto &filter_entry : bind_data.table_filters.filters) {
 					auto filter_col = filter_entry.first;
 					auto &vec = scan_chunk.data[filter_col];
@@ -174,7 +163,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				}
 
 				if (passes) {
-					auto rid = static_cast<idx_t>(row_id_data[i]);
+					auto rid = current_row + i;
 					auto word = rid / 64;
 					if (word >= filter_bitset.size()) {
 						filter_bitset.resize(word + 1, 0);
@@ -182,8 +171,8 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					filter_bitset[word] |= (1ULL << (rid % 64));
 				}
 			}
+			current_row += scan_chunk.size();
 		}
-
 
 
 		result->index_state = hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit,
