@@ -1,17 +1,16 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
@@ -181,6 +180,25 @@ public:
 			return false;
 		}
 
+		// Push table filters into the bind data for filtered HNSW search
+		if (!get.table_filters.filters.empty()) {
+			auto &column_ids = get.GetColumnIds();
+			idx_t scan_pos = 0;
+			unordered_map<idx_t, idx_t> key_remap;
+			for (const auto &entry : get.table_filters.filters) {
+				auto table_col_idx = entry.first;
+				auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
+				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
+				bind_data->filter_scan_types.push_back(col.GetType());
+				key_remap[table_col_idx] = scan_pos++;
+			}
+			for (auto &entry : get.table_filters.filters) {
+				auto new_key = key_remap[entry.first];
+				bind_data->table_filters.filters[new_key] = entry.second->Copy();
+			}
+			get.table_filters.filters.clear();
+		}
+
 		// Replace the aggregate with a index scan + projection
 		get.function = HNSWIndexScanFunction::GetFunction();
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
@@ -191,38 +209,6 @@ public:
 		// Replace the aggregate with a list() aggregate function ordered by the distance
 		agg.expressions[0] = CreateListOrderByExpr(context, col_expr->Copy(), dist_expr->Copy(),
 		                                           agg_func_expr.filter ? agg_func_expr.filter->Copy() : nullptr);
-
-		if (get.table_filters.filters.empty()) {
-			return true;
-		}
-
-		// We need to pullup the filters from the table scan as our index scan does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters.filters) {
-			idx_t column_id = entry.first;
-			auto &type = get.returned_types[column_id];
-			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
-					column_id = i;
-					found = true;
-					break;
-				}
-			}
-			if (!found) {
-				throw InternalException("Could not find column id for filter");
-			}
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
-			new_filter->expressions.push_back(entry.second->ToExpression(*column));
-		}
-
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
 
 		return true;
 	}
