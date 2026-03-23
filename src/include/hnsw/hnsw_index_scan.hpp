@@ -29,9 +29,9 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 	//! The query vector
 	unsafe_unique_array<float> query;
 
-	//! Optional: table filters to push into the index scan (for filtered search)
-	//! The filter keys match positions in filter_scan_column_ids.
-	TableFilterSet table_filters;
+	//! Optional: table filters to push into the index scan (for filtered search).
+	//! Mutable because the DuckDB scan API takes non-const optional_ptr<TableFilterSet>.
+	mutable TableFilterSet table_filters;
 
 	//! Column IDs for the filter scan. Includes all columns needed by filters
 	//! (in positions matching the filter keys) plus ROW_ID at the end.

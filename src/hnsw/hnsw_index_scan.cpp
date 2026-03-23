@@ -80,10 +80,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		// Pass table filters to InitializeScan so DuckDB uses zone maps to skip
 		// non-matching row groups and evaluates filters per-row natively.
 		// This avoids a full table scan — only matching rows are returned.
-		auto &mutable_filters = const_cast<TableFilterSet &>(bind_data.table_filters);
 		TableScanState scan_state;
 		scan_state.Initialize(filter_scan_col_ids);
-		data_table.InitializeScan(context, transaction, scan_state, filter_scan_col_ids, &mutable_filters);
+		data_table.InitializeScan(context, transaction, scan_state, filter_scan_col_ids, &bind_data.table_filters);
 
 		auto total_rows = data_table.GetTotalRows();
 		vector<uint64_t> filter_bitset((total_rows / 64) + 1, 0);
