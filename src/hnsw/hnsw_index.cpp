@@ -345,9 +345,8 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
                                                               ClientContext &context) {
 	auto state = make_uniq<HNSWIndexScanState>();
 
-	// Try to get the ef_search parameter from the database or use the default value
+	// Get ef_search parameter
 	auto ef_search = index.expansion_search();
-
 	Value hnsw_ef_search_opt;
 	if (context.TryGetCurrentSetting("hnsw_ef_search", hnsw_ef_search_opt)) {
 		if (!hnsw_ef_search_opt.IsNull() && hnsw_ef_search_opt.type() == LogicalType::BIGINT) {
@@ -358,6 +357,31 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 		}
 	}
 
+	// Compute selectivity from bitset
+	idx_t popcount = 0;
+	for (auto &word : filter_bitset) {
+		popcount += __builtin_popcountll(word);
+	}
+	auto total = index.size();
+	float selectivity = total > 0 ? static_cast<float>(popcount) / static_cast<float>(total) : 0.0f;
+
+	// Get selectivity thresholds (configurable via SET)
+	float acorn_threshold = 0.6f;
+	float bruteforce_threshold = 0.01f;
+
+	Value acorn_thresh_opt;
+	if (context.TryGetCurrentSetting("hnsw_acorn_threshold", acorn_thresh_opt)) {
+		if (!acorn_thresh_opt.IsNull()) {
+			acorn_threshold = acorn_thresh_opt.GetValue<float>();
+		}
+	}
+	Value bf_thresh_opt;
+	if (context.TryGetCurrentSetting("hnsw_bruteforce_threshold", bf_thresh_opt)) {
+		if (!bf_thresh_opt.IsNull()) {
+			bruteforce_threshold = bf_thresh_opt.GetValue<float>();
+		}
+	}
+
 	// Build predicate from filter bitset
 	auto predicate = [&filter_bitset](row_t key) -> bool {
 		auto word = static_cast<idx_t>(key) / 64;
@@ -365,13 +389,20 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 		return word < filter_bitset.size() && (filter_bitset[word] & (1ULL << bit)) != 0;
 	};
 
-	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	// Use ACORN-1 search: two-hop expansion through failed neighbors
-	// for better recall under selective predicates.
-	// wanted = limit (how many results to return), ef_search controls
-	// the expansion factor (how many graph nodes to explore).
-	auto search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
+
+	USearchIndexType::search_result_t search_result;
+	if (selectivity > acorn_threshold) {
+		// High selectivity: standard HNSW search (post-filter handles the rest)
+		search_result = index.ef_search(query_vector, limit, ef_search);
+	} else if (popcount > 0 && selectivity < bruteforce_threshold) {
+		// Very low selectivity: brute-force exact scan over all matching rows
+		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate,
+		                                                 /*thread=*/0, /*exact=*/true);
+	} else {
+		// Medium selectivity: ACORN-1 filtered search with two-hop expansion
+		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
+	}
 
 	state->current_row = 0;
 	state->total_rows = search_result.size();
@@ -755,10 +786,18 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	                             "experimental: enable creating HNSW indexes in persistent databases",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// Register scan option
+	// Register scan options
 	db.config.AddExtensionOption("hnsw_ef_search",
 	                             "experimental: override the ef_search parameter when scanning HNSW indexes",
 	                             LogicalType::BIGINT);
+
+	// ACORN-1 filtered search thresholds
+	db.config.AddExtensionOption("hnsw_acorn_threshold",
+	                             "selectivity above which ACORN-1 is skipped (standard HNSW + post-filter used instead)",
+	                             LogicalType::FLOAT, Value::FLOAT(0.6f));
+	db.config.AddExtensionOption("hnsw_bruteforce_threshold",
+	                             "selectivity below which brute-force exact scan is used instead of ACORN-1",
+	                             LogicalType::FLOAT, Value::FLOAT(0.01f));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

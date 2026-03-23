@@ -4106,6 +4106,12 @@ private:
 			if (!visits.reserve(visits.size() + candidate_neighbors.size()))
 				return false;
 
+				// Track pass/fail ratio for per-node expansion threshold.
+			// If >=90% of neighbors pass the predicate, the neighborhood is
+			// well-connected and two-hop expansion is unnecessary overhead.
+			std::size_t neighbors_checked = 0;
+			std::size_t neighbors_passing = 0;
+
 			for (compressed_slot_t successor_slot : candidate_neighbors) {
 				if (visits.set(successor_slot))
 					continue;
@@ -4117,12 +4123,14 @@ private:
 					bool passes = is_dummy<predicate_at>() ||
 					    predicate(member_cref_t {node_at_(successor_slot).ckey(), successor_slot});
 
+					neighbors_checked++;
 					if (passes) {
+						neighbors_passing++;
 						top.insert({successor_dist, successor_slot}, top_limit);
-					} else {
+					} else if (neighbors_checked < 2 ||
+					           neighbors_passing * 10 < neighbors_checked * 9) {
 						// ACORN-1: two-hop expansion through failed neighbor.
-						// Explore this node's neighbors to find predicate-satisfying
-						// nodes that are still geometrically close to the query.
+						// Skip if >=90% of checked neighbors pass (Lucene's threshold).
 						neighbors_ref_t two_hop = neighbors_base_(node_at_(successor_slot));
 
 						if (!visits.reserve(visits.size() + two_hop.size()))
