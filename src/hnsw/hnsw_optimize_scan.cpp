@@ -152,32 +152,62 @@ public:
 			return false;
 		}
 
-		// If there are no table filters pushed down into the get, we can just replace the get with the index scan
+		// If there are table filters, set up the filter scan info in the bind data.
+		// Also pull filters up as a LogicalFilter for plan correctness (the filtered
+		// index scan makes the post-filter redundant but the plan structure requires it).
+		if (!get.table_filters.filters.empty()) {
+			// table_filters keys are TABLE column indices (not positions in column_ids).
+			// We need to remap them to storage column indices for our independent scan.
+			// Build scan columns using storage column IDs, and remap filter keys accordingly.
+			auto &column_ids = get.GetColumnIds();
+
+			// For each filter, map the GET position to a storage column index.
+			// Our scan will include these columns in order, so remap filter keys to
+			// new consecutive positions in our scan output.
+			idx_t scan_pos = 0;
+			unordered_map<idx_t, idx_t> key_remap; // old filter key -> new scan position
+			for (const auto &entry : get.table_filters.filters) {
+				// entry.first is the TABLE column index (not the position in column_ids)
+				auto table_col_idx = entry.first;
+				auto storage_oid = duck_table.GetColumn(LogicalIndex(table_col_idx)).StorageOid();
+				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(storage_oid));
+				bind_data->filter_scan_types.push_back(duck_table.GetColumn(LogicalIndex(table_col_idx)).GetType());
+				key_remap[table_col_idx] = scan_pos++;
+			}
+			// Add ROW_ID at the end
+			bind_data->filter_scan_column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+			bind_data->filter_scan_types.push_back(LogicalType::ROW_TYPE);
+
+			// Copy filters with remapped keys
+			for (auto &entry : get.table_filters.filters) {
+				auto new_key = key_remap[entry.first];
+				bind_data->table_filters.filters[new_key] = entry.second->Copy();
+			}
+		}
+
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.function = HNSWIndexScanFunction::GetFunction();
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 		if (get.table_filters.filters.empty()) {
-
-			// Remove the TopN operator
+			// No filters — just remove TopN
 			plan = std::move(top_n.children[0]);
 			return true;
 		}
 
-		// Otherwise, things get more complicated. We need to pullup the filters from the table scan as our index scan
-		// does not support regular filter pushdown.
+		// Pull up the filters as a LogicalFilter node (keeps plan structure intact)
 		get.projection_ids.clear();
 		get.types.clear();
 
 		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
+		auto &get_column_ids = get.GetColumnIds();
 		for (const auto &entry : get.table_filters.filters) {
 			idx_t column_id = entry.first;
 			auto &type = get.returned_types[column_id];
 			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
+			for (idx_t i = 0; i < get_column_ids.size(); i++) {
+				if (get_column_ids[i].GetPrimaryIndex() == column_id) {
 					column_id = i;
 					found = true;
 					break;
