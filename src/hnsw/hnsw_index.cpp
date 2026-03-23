@@ -399,6 +399,16 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 		return word < filter_bitset.size() && (filter_bitset[word] & (1ULL << bit)) != 0;
 	};
 
+	// Auto-tune ef_search for filtered search: at low selectivity, the search
+	// needs to explore more candidates to find enough matching rows.
+	// Scale inversely with selectivity, capped at index size.
+	if (selectivity > 0.0f && selectivity < 1.0f) {
+		auto needed = static_cast<idx_t>(static_cast<float>(limit * 2) / selectivity);
+		if (needed > ef_search) {
+			ef_search = (needed < index.size()) ? needed : static_cast<idx_t>(index.size());
+		}
+	}
+
 	auto lock = rwlock.GetSharedLock();
 
 	USearchIndexType::search_result_t search_result;
