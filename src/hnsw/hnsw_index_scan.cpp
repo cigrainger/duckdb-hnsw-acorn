@@ -125,8 +125,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
 
 		// Build scan column IDs: filter columns + ROW_ID (last).
-		// Use CreateIndexScan which properly populates the ROW_ID virtual column,
-		// ensuring we get actual row IDs (not ordinals) even after deletes.
+		// Use the transactional Scan to respect delete visibility.
 		auto filter_scan_col_ids = bind_data.filter_scan_column_ids;
 		auto filter_scan_types = bind_data.filter_scan_types;
 		filter_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
@@ -144,7 +143,12 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 
 		auto row_id_col_idx = filter_scan_types.size() - 1;
 
-		while (data_table.CreateIndexScan(scan_state, scan_chunk, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+		while (true) {
+			scan_chunk.Reset();
+			data_table.Scan(transaction, scan_chunk, scan_state);
+			if (scan_chunk.size() == 0) {
+				break;
+			}
 			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
 
 			for (idx_t i = 0; i < scan_chunk.size(); i++) {
@@ -170,11 +174,10 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					filter_bitset[word] |= (1ULL << (rid % 64));
 				}
 			}
-			scan_chunk.Reset();
 		}
 
-		result->index_state =
-		    hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit, filter_bitset, context);
+		result->index_state = hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit,
+		                                                        std::move(filter_bitset), context);
 	} else {
 		result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), bind_data.limit, context);
 	}

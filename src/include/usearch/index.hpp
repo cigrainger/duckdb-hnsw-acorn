@@ -2934,12 +2934,12 @@ public:
 	 *          on the base layer for better recall under selective predicates.
 	 */
 	template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at = dummy_prefetch_t>
-	search_result_t search_acorn1(                     //
-	    value_at &&query,                              //
-	    std::size_t wanted,                            //
-	    metric_at &&metric,                            //
-	    index_search_config_t config = {},             //
-	    predicate_at &&predicate = predicate_at {},    //
+	search_result_t search_acorn1(                  //
+	    value_at &&query,                           //
+	    std::size_t wanted,                         //
+	    metric_at &&metric,                         //
+	    index_search_config_t config = {},          //
+	    predicate_at &&predicate = predicate_at {}, //
 	    prefetch_at &&prefetch = prefetch_at {}) const usearch_noexcept_m {
 
 		if (!wanted)
@@ -4063,7 +4063,7 @@ private:
 	 *  from Weaviate (only expand when the first-hop neighbor fails the predicate).
 	 */
 	template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at>
-	bool search_to_find_in_base_acorn1_(                                                           //
+	bool search_to_find_in_base_acorn1_(                                                        //
 	    value_at &&query, metric_at &&metric, predicate_at &&predicate, prefetch_at &&prefetch, //
 	    std::size_t start_slot, std::size_t expansion, context_t &context) const usearch_noexcept_m {
 
@@ -4106,7 +4106,7 @@ private:
 			if (!visits.reserve(visits.size() + candidate_neighbors.size()))
 				return false;
 
-				// Track pass/fail ratio for per-node expansion threshold.
+			// Track pass/fail ratio for per-node expansion threshold.
 			// If >=90% of neighbors pass the predicate, the neighborhood is
 			// well-connected and two-hop expansion is unnecessary overhead.
 			std::size_t neighbors_checked = 0;
@@ -4121,14 +4121,13 @@ private:
 					next.insert({-successor_dist, successor_slot});
 
 					bool passes = is_dummy<predicate_at>() ||
-					    predicate(member_cref_t {node_at_(successor_slot).ckey(), successor_slot});
+					              predicate(member_cref_t {node_at_(successor_slot).ckey(), successor_slot});
 
 					neighbors_checked++;
 					if (passes) {
 						neighbors_passing++;
 						top.insert({successor_dist, successor_slot}, top_limit);
-					} else if (neighbors_checked < 2 ||
-					           neighbors_passing * 10 < neighbors_checked * 9) {
+					} else if (neighbors_checked < 2 || neighbors_passing * 10 < neighbors_checked * 9) {
 						// ACORN-1: two-hop expansion through failed neighbor.
 						// Skip if >=90% of checked neighbors pass (Lucene's threshold).
 						neighbors_ref_t two_hop = neighbors_base_(node_at_(successor_slot));
@@ -4149,7 +4148,7 @@ private:
 							}
 						}
 					}
-					// Always update radius after potential top changes
+					// Update radius after any top changes (both pass and fail paths)
 					if (top.size() >= top_limit)
 						radius = top.top().distance;
 				}

@@ -341,8 +341,7 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 }
 
 unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector, idx_t limit,
-                                                             const vector<uint64_t> &filter_bitset,
-                                                             ClientContext &context) {
+                                                             vector<uint64_t> filter_bitset, ClientContext &context) {
 	auto state = make_uniq<HNSWIndexScanState>();
 
 	// Get ef_search parameter
@@ -359,8 +358,19 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 
 	// Compute selectivity from bitset
 	idx_t popcount = 0;
-	for (auto &word : filter_bitset) {
-		popcount += __builtin_popcountll(word);
+	for (auto &w : filter_bitset) {
+		// Portable popcount: works on GCC, Clang, and MSVC
+#if defined(__GNUC__) || defined(__clang__)
+		popcount += __builtin_popcountll(w);
+#elif defined(_MSC_VER)
+		popcount += __popcnt64(w);
+#else
+		auto v = w;
+		while (v) {
+			popcount++;
+			v &= v - 1;
+		}
+#endif
 	}
 	auto total = index.size();
 	float selectivity = total > 0 ? static_cast<float>(popcount) / static_cast<float>(total) : 0.0f;
@@ -382,7 +392,7 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 		}
 	}
 
-	// Build predicate from filter bitset
+	// Build predicate from filter bitset (owned by this function via move).
 	auto predicate = [&filter_bitset](row_t key) -> bool {
 		auto word = static_cast<idx_t>(key) / 64;
 		auto bit = static_cast<idx_t>(key) % 64;

@@ -55,8 +55,8 @@ public:
 	void ResetMultiScan(IndexScanState &state);
 
 	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context);
-	unique_ptr<IndexScanState> InitializeFilteredScan(float *query_vector, idx_t limit,
-	                                                  const vector<uint64_t> &filter_bitset, ClientContext &context);
+	unique_ptr<IndexScanState> InitializeFilteredScan(float *query_vector, idx_t limit, vector<uint64_t> filter_bitset,
+	                                                  ClientContext &context);
 	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
 	idx_t GetVectorSize() const;
 	string GetMetric() const;
