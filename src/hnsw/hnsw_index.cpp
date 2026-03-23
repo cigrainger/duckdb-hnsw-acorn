@@ -688,13 +688,15 @@ bool HNSWIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 void HNSWIndex::Vacuum(IndexLock &state) {
 }
 
-void HNSWIndex::Verify(IndexLock &state) {
+void HNSWIndex::Verify(IndexLock &l) {
 	// No-op: HNSW index verification not implemented
 }
 
-string HNSWIndex::ToString(IndexLock &state, bool display_ascii) {
+string HNSWIndex::ToString(IndexLock &l, bool display_ascii) {
 	return StringUtil::Format("HNSW Index [%s] (%llu entries)", GetIndexName(), index.size());
 }
+
+//! Ensures that the
 
 void HNSWIndex::VerifyAllocations(IndexLock &state) {
 	throw NotImplementedException("HNSWIndex::VerifyAllocations() not implemented");

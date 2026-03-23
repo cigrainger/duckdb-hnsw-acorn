@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -126,9 +127,9 @@ public:
 		vector<reference<Expression>> bindings;
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		table_info.GetIndexes().Scan([&](Index &index) {
+		for(auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
-				return false;
+				continue;
 			}
 			auto &cast_index = index.Cast<HNSWIndex>();
 
@@ -137,12 +138,12 @@ public:
 
 			// Check that the projection expression is a distance function that matches the index
 			if (!cast_index.TryMatchDistanceFunction(dist_expr, bindings)) {
-				return false;
+				continue;
 			}
 			// Check that the HNSW index actually indexes the expression
 			unique_ptr<Expression> index_expr;
 			if (!cast_index.TryBindIndexExpression(get, index_expr)) {
-				return false;
+				continue;
 			}
 
 			// Now, ensure that one of the bindings is a constant vector, and the other our index expression
@@ -155,7 +156,7 @@ public:
 				if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT ||
 				    !index_expr->Equals(index_expr_ref)) {
 					// Nope, not a match, we can't optimize.
-					return false;
+					continue;
 				}
 			}
 
@@ -169,11 +170,11 @@ public:
 			}
 			const auto k_limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int32_t>();
 			if (k_limit <= 0 || k_limit >= STANDARD_VECTOR_SIZE) {
-				return false;
+				continue;
 			}
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, k_limit, std::move(query_vector));
-			return true;
-		});
+			break;
+		}
 
 		if (!bind_data) {
 			// No index found
@@ -225,7 +226,7 @@ public:
 
 void HNSWModule::RegisterTopKOptimizer(DatabaseInstance &db) {
 	// Register the TopKOptimizer
-	db.config.optimizer_extensions.push_back(HNSWTopKOptimizer());
+	OptimizerExtension::Register(db.config, HNSWTopKOptimizer());
 }
 
 } // namespace duckdb
