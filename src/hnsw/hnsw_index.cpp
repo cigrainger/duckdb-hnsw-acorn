@@ -341,8 +341,8 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 }
 
 unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector, idx_t limit,
-                                                              const vector<uint64_t> &filter_bitset,
-                                                              ClientContext &context) {
+                                                             const vector<uint64_t> &filter_bitset,
+                                                             ClientContext &context) {
 	auto state = make_uniq<HNSWIndexScanState>();
 
 	// Get ef_search parameter
@@ -398,7 +398,7 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 	} else if (popcount > 0 && selectivity < bruteforce_threshold) {
 		// Very low selectivity: brute-force exact scan over all matching rows
 		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate,
-		                                                 /*thread=*/0, /*exact=*/true);
+		                                                /*thread=*/0, /*exact=*/true);
 	} else {
 		// Medium selectivity: ACORN-1 filtered search with two-hop expansion
 		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
@@ -765,7 +765,6 @@ void HNSWIndex::VerifyBuffers(IndexLock &lock) {
 	linked_block_allocator->VerifyBuffers();
 }
 
-
 //------------------------------------------------------------------------------
 // Register Index Type
 //------------------------------------------------------------------------------
@@ -792,9 +791,9 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	                             LogicalType::BIGINT);
 
 	// ACORN-1 filtered search thresholds
-	db.config.AddExtensionOption("hnsw_acorn_threshold",
-	                             "selectivity above which ACORN-1 is skipped (standard HNSW + post-filter used instead)",
-	                             LogicalType::FLOAT, Value::FLOAT(0.6f));
+	db.config.AddExtensionOption(
+	    "hnsw_acorn_threshold", "selectivity above which ACORN-1 is skipped (standard HNSW + post-filter used instead)",
+	    LogicalType::FLOAT, Value::FLOAT(0.6f));
 	db.config.AddExtensionOption("hnsw_bruteforce_threshold",
 	                             "selectivity below which brute-force exact scan is used instead of ACORN-1",
 	                             LogicalType::FLOAT, Value::FLOAT(0.01f));

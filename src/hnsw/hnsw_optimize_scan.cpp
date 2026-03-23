@@ -2,16 +2,15 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
@@ -167,10 +166,13 @@ public:
 			idx_t scan_pos = 0;
 			unordered_map<idx_t, idx_t> key_remap; // old filter key -> new scan position
 			for (const auto &entry : get.table_filters.filters) {
-				// entry.first is the TABLE column index (logical, 0-based)
+				// entry.first is the TABLE column index (logical, 0-based).
+				// Convert to storage OID for the scan API — these can diverge
+				// after column-altering operations (ADD/DROP COLUMN).
 				auto table_col_idx = entry.first;
-				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(table_col_idx));
-				bind_data->filter_scan_types.push_back(duck_table.GetColumn(LogicalIndex(table_col_idx)).GetType());
+				auto &col = duck_table.GetColumn(LogicalIndex(table_col_idx));
+				bind_data->filter_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
+				bind_data->filter_scan_types.push_back(col.GetType());
 				key_remap[table_col_idx] = scan_pos++;
 			}
 

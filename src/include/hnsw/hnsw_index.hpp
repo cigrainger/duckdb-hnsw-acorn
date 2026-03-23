@@ -7,14 +7,13 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
-#include "duckdb/execution/index/index_pointer.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/execution/index/index_pointer.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/index_storage_info.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
-
 #include "usearch/index_dense.hpp"
 
 namespace duckdb {
@@ -57,7 +56,7 @@ public:
 
 	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context);
 	unique_ptr<IndexScanState> InitializeFilteredScan(float *query_vector, idx_t limit,
-	                                                   const vector<uint64_t> &filter_bitset, ClientContext &context);
+	                                                  const vector<uint64_t> &filter_bitset, ClientContext &context);
 	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
 	idx_t GetVectorSize() const;
 	string GetMetric() const;

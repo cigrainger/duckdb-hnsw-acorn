@@ -5,19 +5,18 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
@@ -125,10 +124,13 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		auto &data_table = bind_data.table.GetStorage();
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
 
-		// Scan the table with only the filter columns (no ROW_ID — it's not a real column).
-		// Track row index manually; for sequential scans, row index = row_id.
-		auto &filter_scan_col_ids = bind_data.filter_scan_column_ids;
-		auto &filter_scan_types = bind_data.filter_scan_types;
+		// Build scan column IDs: filter columns + ROW_ID (last).
+		// Use CreateIndexScan which properly populates the ROW_ID virtual column,
+		// ensuring we get actual row IDs (not ordinals) even after deletes.
+		auto filter_scan_col_ids = bind_data.filter_scan_column_ids;
+		auto filter_scan_types = bind_data.filter_scan_types;
+		filter_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+		filter_scan_types.push_back(LogicalType::ROW_TYPE);
 
 		TableScanState scan_state;
 		scan_state.Initialize(filter_scan_col_ids);
@@ -140,13 +142,10 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		DataChunk scan_chunk;
 		scan_chunk.Initialize(context, filter_scan_types);
 
-		idx_t current_row = 0;
-		while (true) {
-			scan_chunk.Reset();
-			data_table.Scan(transaction, scan_chunk, scan_state);
-			if (scan_chunk.size() == 0) {
-				break;
-			}
+		auto row_id_col_idx = filter_scan_types.size() - 1;
+
+		while (data_table.CreateIndexScan(scan_state, scan_chunk, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
 
 			for (idx_t i = 0; i < scan_chunk.size(); i++) {
 				bool passes = true;
@@ -163,7 +162,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				}
 
 				if (passes) {
-					auto rid = current_row + i;
+					auto rid = static_cast<idx_t>(row_id_data[i]);
 					auto word = rid / 64;
 					if (word >= filter_bitset.size()) {
 						filter_bitset.resize(word + 1, 0);
@@ -171,12 +170,11 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					filter_bitset[word] |= (1ULL << (rid % 64));
 				}
 			}
-			current_row += scan_chunk.size();
+			scan_chunk.Reset();
 		}
 
-
-		result->index_state = hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit,
-		                                                         filter_bitset, context);
+		result->index_state =
+		    hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit, filter_bitset, context);
 	} else {
 		result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), bind_data.limit, context);
 	}

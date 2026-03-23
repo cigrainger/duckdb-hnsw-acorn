@@ -4,8 +4,8 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/function/function.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_index.hpp"
 
