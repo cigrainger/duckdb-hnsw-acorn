@@ -5,9 +5,6 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
@@ -43,56 +40,6 @@ struct HNSWIndexScanGlobalState : public GlobalTableFunctionState {
 	vector<idx_t> projection_ids;
 };
 
-// Recursively evaluate a TableFilter against a value
-static bool EvaluateTableFilter(const TableFilter &filter, const Value &val) {
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &const_filter = filter.Cast<ConstantFilter>();
-		if (val.IsNull()) {
-			return false;
-		}
-		switch (const_filter.comparison_type) {
-		case ExpressionType::COMPARE_EQUAL:
-			return Value::DefaultValuesAreEqual(val, const_filter.constant);
-		case ExpressionType::COMPARE_GREATERTHAN:
-			return val > const_filter.constant;
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-			return val >= const_filter.constant;
-		case ExpressionType::COMPARE_LESSTHAN:
-			return val < const_filter.constant;
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			return val <= const_filter.constant;
-		default:
-			return true;
-		}
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		for (auto &child : conj.child_filters) {
-			if (!EvaluateTableFilter(*child, val)) {
-				return false;
-			}
-		}
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
-		for (auto &child : conj.child_filters) {
-			if (EvaluateTableFilter(*child, val)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case TableFilterType::IS_NOT_NULL:
-		return !val.IsNull();
-	case TableFilterType::IS_NULL:
-		return val.IsNull();
-	default:
-		return true;
-	}
-}
-
 static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContext &context,
                                                                     TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HNSWIndexScanBindData>();
@@ -125,15 +72,18 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
 
 		// Build scan column IDs: filter columns + ROW_ID (last).
-		// Use the transactional Scan to respect delete visibility.
 		auto filter_scan_col_ids = bind_data.filter_scan_column_ids;
 		auto filter_scan_types = bind_data.filter_scan_types;
 		filter_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 		filter_scan_types.push_back(LogicalType::ROW_TYPE);
 
+		// Pass table filters to InitializeScan so DuckDB uses zone maps to skip
+		// non-matching row groups and evaluates filters per-row natively.
+		// This avoids a full table scan — only matching rows are returned.
+		auto &mutable_filters = const_cast<TableFilterSet &>(bind_data.table_filters);
 		TableScanState scan_state;
 		scan_state.Initialize(filter_scan_col_ids);
-		data_table.InitializeScan(context, transaction, scan_state, filter_scan_col_ids);
+		data_table.InitializeScan(context, transaction, scan_state, filter_scan_col_ids, &mutable_filters);
 
 		auto total_rows = data_table.GetTotalRows();
 		vector<uint64_t> filter_bitset((total_rows / 64) + 1, 0);
@@ -141,8 +91,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		DataChunk scan_chunk;
 		scan_chunk.Initialize(context, filter_scan_types);
 
+		// ROW_ID is the last column. All rows returned by Scan already
+		// pass the filter — just collect their row_ids into the bitset.
 		auto row_id_col_idx = filter_scan_types.size() - 1;
-
 		while (true) {
 			scan_chunk.Reset();
 			data_table.Scan(transaction, scan_chunk, scan_state);
@@ -150,29 +101,13 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				break;
 			}
 			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
-
 			for (idx_t i = 0; i < scan_chunk.size(); i++) {
-				bool passes = true;
-
-				for (const auto &filter_entry : bind_data.table_filters.filters) {
-					auto filter_col = filter_entry.first;
-					auto &vec = scan_chunk.data[filter_col];
-					auto val = vec.GetValue(i);
-
-					if (!EvaluateTableFilter(*filter_entry.second, val)) {
-						passes = false;
-						break;
-					}
+				auto rid = static_cast<idx_t>(row_id_data[i]);
+				auto word = rid / 64;
+				if (word >= filter_bitset.size()) {
+					filter_bitset.resize(word + 1, 0);
 				}
-
-				if (passes) {
-					auto rid = static_cast<idx_t>(row_id_data[i]);
-					auto word = rid / 64;
-					if (word >= filter_bitset.size()) {
-						filter_bitset.resize(word + 1, 0);
-					}
-					filter_bitset[word] |= (1ULL << (rid % 64));
-				}
+				filter_bitset[word] |= (1ULL << (rid % 64));
 			}
 		}
 
