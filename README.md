@@ -11,12 +11,16 @@
 > - Per-node expansion threshold (Lucene's 90% rule) skips two-hop when the neighborhood is already well-connected
 > - Configurable thresholds: `SET hnsw_acorn_threshold = 0.6` and `SET hnsw_bruteforce_threshold = 0.01`
 >
-> **Benchmark (496k word embeddings, 300-dim):**
-> | Filter selectivity | Upstream (post-filter) | This fork (ACORN-1) |
-> |---|---|---|
-> | ~8% (letter S) | 0-2 of 10 | **10 of 10** |
-> | ~0.3% (letter Z) | 0 of 10 | **10 of 10** |
-> | ~0.1% (letter X) | 0 of 10 | **10 of 10** |
+> **Benchmark (228k movies, 768-dim Nomic embeddings):**
+> | Filter | Selectivity | Upstream | ACORN-1 |
+> |---|---|---|---|
+> | English only | ~60% | ~10/10 | **10/10** |
+> | Japanese only | ~3% | 0-1/10 | **10/10** |
+> | Korean only | ~1% | 0/10 | **10/10** |
+> | Rating >= 8.0 | ~5% | 0/10 | **10/10** |
+>
+> Query: movies similar to *The Matrix*, filtered by language → returns *Matrix Revolutions*, *Gunhed* (ja), *Savior of the Earth* (ko).
+> See [`test/benchmark/movies_real_benchmark.sql`](test/benchmark/movies_real_benchmark.sql) for the full benchmark.
 
 ---
 
