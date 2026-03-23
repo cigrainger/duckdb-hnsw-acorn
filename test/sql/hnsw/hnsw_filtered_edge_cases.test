@@ -76,3 +76,27 @@ SELECT id FROM items WHERE id = 250
 ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5;
 ----
 250
+
+# ------------------------------------------------------------------
+# Subquery query vector falls back to seq scan (documented limitation)
+# Should still return correct results, just not via HNSW index
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE qvec AS SELECT vec AS q FROM items WHERE id = 0;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_distance(vec, (SELECT q FROM qvec)) LIMIT 10
+);
+----
+10
+
+# ------------------------------------------------------------------
+# TopK optimizer: MIN_BY with filter
+# ------------------------------------------------------------------
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5))
+FROM items WHERE category = 1;
+----
+5

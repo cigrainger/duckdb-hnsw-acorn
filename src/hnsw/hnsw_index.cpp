@@ -398,6 +398,9 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 	}
 
 	// Build predicate from filter bitset (owned by this function via move).
+	// LIFETIME: captures filter_bitset by reference. Safe because
+	// ef_acorn1_filtered_search executes synchronously — the predicate
+	// does not outlive this function scope.
 	auto predicate = [&filter_bitset](row_t key) -> bool {
 		auto word = static_cast<idx_t>(key) / 64;
 		auto bit = static_cast<idx_t>(key) % 64;

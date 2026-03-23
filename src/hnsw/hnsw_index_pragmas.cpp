@@ -120,7 +120,7 @@ static void HNSWIndexInfoExecute(ClientContext &context, TableFunctionInput &dat
 		auto &table_info = *storage.GetDataTableInfo();
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
+		for (auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
 				continue;
 			}
@@ -200,7 +200,7 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 
 	auto &table_info = *storage.GetDataTableInfo();
 	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-	for(auto &index : table_info.GetIndexes().Indexes()) {
+	for (auto &index : table_info.GetIndexes().Indexes()) {
 		if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
 			continue;
 		}
