@@ -195,6 +195,10 @@ public:
 				auto new_key = key_remap[entry.first];
 				bind_data->table_filters.filters[new_key] = entry.second->Copy();
 			}
+
+			// Clear the GET's table_filters — they're now handled by the
+			// filtered index scan. No need to pull them up as a post-filter.
+			get.table_filters.filters.clear();
 		}
 
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
