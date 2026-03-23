@@ -1,7 +1,7 @@
 # name: test/sql/hnsw/hnsw_insert_wal.test
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 # TODO: This doesnt actually test the WAL because of issues upstream. Fix this once WAL playback is fixed for extension indexes
 require noforcestorage

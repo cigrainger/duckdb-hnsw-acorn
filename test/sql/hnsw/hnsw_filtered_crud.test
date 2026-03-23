@@ -2,7 +2,7 @@
 # description: Test filtered HNSW search after inserts and deletes
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 statement ok
 CREATE TABLE items AS

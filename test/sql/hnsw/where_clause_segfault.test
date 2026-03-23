@@ -2,7 +2,7 @@
 # description: If a where clause is present the code segfaults
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 # First try the failing case
 

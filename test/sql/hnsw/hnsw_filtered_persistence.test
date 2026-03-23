@@ -2,7 +2,7 @@
 # description: Test filtered HNSW search survives checkpoint/restart
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 # Need persistence for checkpoint/restart
 load __TEST_DIR__/hnsw_filtered_persist.db

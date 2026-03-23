@@ -8,7 +8,7 @@
 # Tests marked with expected counts reflect current post-filter behavior.
 # When Brief 1 lands, update expected counts to match correct behavior.
 
-require vss
+require hnsw_acorn
 
 # Create a table with vectors and categorical columns for filtering
 statement ok

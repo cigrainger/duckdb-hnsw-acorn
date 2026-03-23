@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 2.8.12...3.29)
 
 # Set extension name here
-set(TARGET_NAME vss)
+set(TARGET_NAME hnsw_acorn)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -18,7 +18,7 @@ endif()
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/vss_extension.cpp)
+set(EXTENSION_SOURCES src/hnsw_acorn_extension.cpp)
 add_subdirectory(src/hnsw)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

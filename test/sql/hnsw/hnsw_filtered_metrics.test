@@ -2,7 +2,7 @@
 # description: Test filtered HNSW search with all distance metrics
 # group: [hnsw]
 
-require vss
+require hnsw_acorn
 
 statement ok
 CREATE TABLE items AS
