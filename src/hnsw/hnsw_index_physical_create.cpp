@@ -12,6 +12,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 #include "hnsw/hnsw_index.hpp"
+#include "hnsw/rabitq.hpp"
 
 #include "duckdb/parallel/base_pipeline_event.hpp"
 
@@ -143,6 +144,11 @@ public:
 	      local_scan_state() {
 		// Initialize the scan chunk
 		gstate.collection->InitializeScanChunk(scan_chunk);
+
+		// Allocate thread-local RaBitQ quantization buffer
+		if (gstate.global_index->IsRaBitQ()) {
+			rabitq_buffer.resize(RaBitQBytesPerVector(gstate.global_index->GetVectorSize()));
+		}
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
@@ -184,8 +190,19 @@ public:
 					return TaskExecutionResult::TASK_ERROR;
 				}
 
-				// Add the vector to the index
-				const auto result = index.add(row_ptr[row_idx], data_ptr + (vec_idx * array_size), thread_id);
+				// Add the vector to the index (quantize first if RaBitQ)
+				unum::usearch::index_dense_gt<row_t>::add_result_t result;
+				if (!rabitq_buffer.empty()) {
+					auto &rabitq_state = gstate.global_index->GetRaBitQState();
+					bool normalize = rabitq_state.original_metric == unum::usearch::metric_kind_t::cos_k;
+					RaBitQQuantizeVector(data_ptr + (vec_idx * array_size), rabitq_state, rabitq_buffer.data(),
+					                     normalize);
+					result = index.add(row_ptr[row_idx],
+					                   reinterpret_cast<const unum::usearch::b1x8_t *>(rabitq_buffer.data()),
+					                   thread_id);
+				} else {
+					result = index.add(row_ptr[row_idx], data_ptr + (vec_idx * array_size), thread_id);
+				}
 
 				// Check for errors
 				if (!result) {
@@ -214,6 +231,7 @@ private:
 
 	DataChunk scan_chunk;
 	ColumnDataLocalScanState local_scan_state;
+	vector<uint8_t> rabitq_buffer; // Thread-local quantization buffer (empty if not RaBitQ)
 };
 
 class HNSWIndexConstructionEvent final : public BasePipelineEvent {
@@ -293,6 +311,14 @@ SinkFinalizeType PhysicalCreateHNSWIndex::Finalize(Pipeline &pipeline, Event &ev
 
 	// Move on to the next phase
 	gstate.is_building = true;
+
+	// For RaBitQ indexes, compute the centroid before parallel construction
+	if (gstate.global_index->IsRaBitQ()) {
+		bool normalize = gstate.global_index->GetRaBitQState().original_metric ==
+		                 unum::usearch::metric_kind_t::cos_k;
+		auto centroid = RaBitQComputeCentroid(*collection, gstate.global_index->GetVectorSize(), normalize);
+		gstate.global_index->SetRaBitQCentroid(std::move(centroid));
+	}
 
 	// Reserve the index size
 	auto &ts = TaskScheduler::GetScheduler(context);

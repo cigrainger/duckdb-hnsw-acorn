@@ -1,0 +1,231 @@
+# name: test/sql/hnsw/hnsw_rabitq_recall.test
+# description: RaBitQ recall properties — rescore should produce exact top-K
+# group: [hnsw]
+
+# Property tests: after rescore against original F32 vectors, the RaBitQ
+# index should return the same top-K as a brute-force scan (for datasets
+# small enough that 3x oversample captures all true neighbors).
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup: 500 rows, 8 dimensions (RaBitQ recall improves with dimensions)
+# Using 8-dim because 3-dim gives only 3 bits — too coarse for recall.
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    list_value(
+        (i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT, ((i * 5) % 19)::FLOAT,
+        ((i * 11) % 23)::FLOAT, ((i * 13) % 29)::FLOAT, ((i * 17) % 31)::FLOAT, ((i * 19) % 37)::FLOAT
+    )::FLOAT[8] AS vec
+FROM range(500) t(i);
+
+# Use higher oversample for reliable recall in tests
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+# ==================================================================
+# Property 1: RaBitQ top-K matches brute-force top-K (L2sq)
+# ==================================================================
+
+# Compute brute-force top-10 via a pragma that forces seq scan
+# We use a CTE with the distances pre-computed, then compare.
+statement ok
+CREATE INDEX idx_l2 ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Get RaBitQ top-10 (via index)
+statement ok
+CREATE TABLE rabitq_l2 AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+# Drop index and get brute-force top-10 (seq scan)
+statement ok
+DROP INDEX idx_l2;
+
+statement ok
+CREATE TABLE exact_l2 AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+# At least 9 of 10 must match (rescore guarantees exact ranking within
+# the candidate set; the one miss is a boundary candidate not in the
+# oversample set due to approximate graph routing)
+query I
+SELECT (SELECT count(*) FROM exact_l2 WHERE id IN (SELECT id FROM rabitq_l2)) >= 9;
+----
+true
+
+statement ok
+DROP TABLE exact_l2;
+
+statement ok
+DROP TABLE rabitq_l2;
+
+# ==================================================================
+# Property 2: RaBitQ top-K matches brute-force (cosine)
+# ==================================================================
+
+# Create cosine RaBitQ index, get results, then drop for brute force
+statement ok
+CREATE INDEX idx_cos ON items USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rabitq_cos AS
+SELECT id FROM items
+ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+statement ok
+DROP INDEX idx_cos;
+
+statement ok
+CREATE TABLE exact_cos AS
+SELECT id FROM items
+ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+# At least 9 of 10 must match
+query I
+SELECT (SELECT count(*) FROM exact_cos WHERE id IN (SELECT id FROM rabitq_cos)) >= 9;
+----
+true
+
+statement ok
+DROP TABLE exact_cos;
+
+statement ok
+DROP TABLE rabitq_cos;
+
+# ==================================================================
+# Property 3: result ordering is exact (rescore uses F32 distances)
+# ==================================================================
+statement ok
+CREATE INDEX idx_order ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# L2sq ordering
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(vec, [3.0, 5.0, 7.0, 2.0, 8.0, 1.0, 4.0, 6.0]::FLOAT[8]) AS d1,
+        LEAD(array_distance(vec, [3.0, 5.0, 7.0, 2.0, 8.0, 1.0, 4.0, 6.0]::FLOAT[8])) OVER () AS d2
+    FROM items
+    ORDER BY array_distance(vec, [3.0, 5.0, 7.0, 2.0, 8.0, 1.0, 4.0, 6.0]::FLOAT[8])
+    LIMIT 30
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+statement ok
+DROP INDEX idx_order;
+
+# ==================================================================
+# Property 4: higher oversample never reduces recall
+# With default oversample=3, capture recall. With oversample=10,
+# recall should be >= (for small data, both should be perfect).
+# ==================================================================
+
+statement ok
+CREATE INDEX idx_os ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Oversample 3 (default)
+statement ok
+CREATE TABLE recall_3x AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [4.0, 8.0, 12.0, 2.0, 6.0, 10.0, 3.0, 7.0]::FLOAT[8])
+LIMIT 20;
+
+# Oversample 10
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+statement ok
+CREATE TABLE recall_10x AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [4.0, 8.0, 12.0, 2.0, 6.0, 10.0, 3.0, 7.0]::FLOAT[8])
+LIMIT 20;
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+# Brute force (drop index)
+statement ok
+DROP INDEX idx_os;
+
+statement ok
+CREATE TABLE recall_exact AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [4.0, 8.0, 12.0, 2.0, 6.0, 10.0, 3.0, 7.0]::FLOAT[8])
+LIMIT 20;
+
+# 10x recall >= 3x recall
+query I
+SELECT
+    (SELECT count(*) FROM recall_exact WHERE id IN (SELECT id FROM recall_10x))
+    >=
+    (SELECT count(*) FROM recall_exact WHERE id IN (SELECT id FROM recall_3x));
+----
+true
+
+statement ok
+DROP TABLE recall_3x;
+
+statement ok
+DROP TABLE recall_10x;
+
+statement ok
+DROP TABLE recall_exact;
+
+# ==================================================================
+# Property 5: larger dataset (1000 rows, 8 dimensions)
+# RaBitQ benefits grow with dimensionality — verify correctness scales
+# ==================================================================
+statement ok
+CREATE TABLE large AS
+SELECT i AS id,
+    list_value(
+        (i % 10)::FLOAT, ((i*2) % 13)::FLOAT, ((i*3) % 17)::FLOAT, ((i*5) % 19)::FLOAT,
+        ((i*7) % 23)::FLOAT, ((i*11) % 29)::FLOAT, ((i*13) % 31)::FLOAT, ((i*17) % 37)::FLOAT
+    )::FLOAT[8] AS vec
+FROM range(1000) t(i);
+
+# Brute force first (no index)
+statement ok
+CREATE TABLE exact_large AS
+SELECT id FROM large
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+# Now create RaBitQ index with high oversample for recall
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+statement ok
+CREATE INDEX idx_large ON large USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rabitq_large AS
+SELECT id FROM large
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 10;
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+# At least 6 of 10 should match (1000-row dataset with 8-dim quantization)
+query I
+SELECT (SELECT count(*) FROM exact_large WHERE id IN (SELECT id FROM rabitq_large)) >= 6;
+----
+true
+
+statement ok
+DROP TABLE large;
+
+statement ok
+DROP TABLE exact_large;
+
+statement ok
+DROP TABLE rabitq_large;

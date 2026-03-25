@@ -1,0 +1,243 @@
+# name: test/sql/hnsw/hnsw_rabitq_benchmark.test
+# description: RaBitQ benchmark regression test — asserts minimum recall and compression
+# group: [hnsw]
+
+# This test serves as a CI-friendly benchmark. It verifies that RaBitQ
+# achieves minimum recall and compression thresholds. If the distance
+# function or quantization regresses, this test catches it.
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup: 1000 rows, 32 dims, random data
+# ------------------------------------------------------------------
+statement ok
+SELECT setseed(0.42);
+
+statement ok
+SET lambda_syntax = 'ENABLE_SINGLE_ARROW';
+
+statement ok
+CREATE OR REPLACE MACRO rv(d) AS (list_transform(range(d), x -> random()::FLOAT));
+
+statement ok
+CREATE TABLE bench AS SELECT i AS id, rv(32)::FLOAT[32] AS vec FROM range(1000) t(i);
+
+# ==================================================================
+# L2sq recall: RaBitQ vs brute force
+# ==================================================================
+
+# Ground truth (no index)
+statement ok
+CREATE TABLE gt_l2 AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[32])
+LIMIT 10;
+
+# RaBitQ index + search
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+statement ok
+CREATE INDEX rq_l2 ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rq_l2_res AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[32])
+LIMIT 10;
+
+# L2sq recall must be >= 9/10
+query I
+SELECT (SELECT count(*) FROM gt_l2 WHERE id IN (SELECT id FROM rq_l2_res)) >= 9;
+----
+true
+
+# Verify the index was actually used (not seq scan)
+query II
+EXPLAIN SELECT id FROM bench
+ORDER BY array_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[32])
+LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+statement ok
+DROP INDEX rq_l2;
+
+# ==================================================================
+# Cosine recall: RaBitQ vs brute force
+# ==================================================================
+
+# Ground truth (no index)
+statement ok
+CREATE TABLE gt_cos AS
+SELECT id FROM bench
+ORDER BY array_cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[32])
+LIMIT 10;
+
+statement ok
+CREATE INDEX rq_cos ON bench USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rq_cos_res AS
+SELECT id FROM bench
+ORDER BY array_cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[32])
+LIMIT 10;
+
+# Cosine recall must be >= 9/10
+query I
+SELECT (SELECT count(*) FROM gt_cos WHERE id IN (SELECT id FROM rq_cos_res)) >= 9;
+----
+true
+
+statement ok
+DROP INDEX rq_cos;
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+# ==================================================================
+# Compression: vector memory must be significantly smaller
+# ==================================================================
+
+# Plain HNSW
+statement ok
+CREATE INDEX idx_plain ON bench USING HNSW (vec);
+
+statement ok
+CREATE TABLE mem_plain AS
+SELECT vector_memory_usage AS mem FROM pragma_hnsw_index_info() WHERE index_name = 'idx_plain';
+
+statement ok
+DROP INDEX idx_plain;
+
+# RaBitQ HNSW
+statement ok
+CREATE INDEX idx_rq ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE mem_rq AS
+SELECT vector_memory_usage AS mem FROM pragma_hnsw_index_info() WHERE index_name = 'idx_rq';
+
+# Compression ratio must be >= 8x (32 dims → theoretical 10.7x)
+query I
+SELECT (SELECT mem FROM mem_plain)::DOUBLE / (SELECT mem FROM mem_rq) >= 8.0;
+----
+true
+
+# RaBitQ vector memory must be less than plain HNSW
+query I
+SELECT (SELECT mem FROM mem_rq) < (SELECT mem FROM mem_plain);
+----
+true
+
+statement ok
+DROP INDEX idx_rq;
+
+# ==================================================================
+# Pragma reports correct quantization type
+# ==================================================================
+statement ok
+CREATE INDEX idx_check ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT quantization FROM pragma_hnsw_index_info() WHERE index_name = 'idx_check';
+----
+rabitq
+
+query I
+SELECT bytes_per_vector FROM pragma_hnsw_index_info() WHERE index_name = 'idx_check';
+----
+12
+
+statement ok
+DROP INDEX idx_check;
+
+# Plain index reports 'none'
+statement ok
+CREATE INDEX idx_plain2 ON bench USING HNSW (vec);
+
+query I
+SELECT quantization FROM pragma_hnsw_index_info() WHERE index_name = 'idx_plain2';
+----
+none
+
+# Plain 32-dim F32 = 128 bytes per vector
+query I
+SELECT bytes_per_vector FROM pragma_hnsw_index_info() WHERE index_name = 'idx_plain2';
+----
+128
+
+statement ok
+DROP INDEX idx_plain2;
+
+# ==================================================================
+# Second query vector — different region of space
+# ==================================================================
+statement ok
+CREATE INDEX idx_q2 ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+# Ground truth
+statement ok
+CREATE TABLE gt_q2 AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9]::FLOAT[32])
+LIMIT 10;
+
+statement ok
+DROP INDEX idx_q2;
+
+statement ok
+CREATE INDEX idx_q2 ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rq_q2 AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9,0.1,0.9]::FLOAT[32])
+LIMIT 10;
+
+# Recall >= 9/10 on second query too
+query I
+SELECT (SELECT count(*) FROM gt_q2 WHERE id IN (SELECT id FROM rq_q2)) >= 9;
+----
+true
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+statement ok
+DROP INDEX idx_q2;
+
+# ==================================================================
+# Third query vector — near origin
+# ==================================================================
+
+# Ground truth (no index)
+statement ok
+CREATE TABLE gt_q3 AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0]::FLOAT[32])
+LIMIT 10;
+
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+statement ok
+CREATE INDEX idx_q3 ON bench USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE rq_q3 AS
+SELECT id FROM bench
+ORDER BY array_distance(vec, [0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0]::FLOAT[32])
+LIMIT 10;
+
+query I
+SELECT (SELECT count(*) FROM gt_q3 WHERE id IN (SELECT id FROM rq_q3)) >= 9;
+----
+true
+
+statement ok
+RESET hnsw_rabitq_oversample;

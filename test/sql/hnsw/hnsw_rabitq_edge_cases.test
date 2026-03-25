@@ -1,0 +1,454 @@
+# name: test/sql/hnsw/hnsw_rabitq_edge_cases.test
+# description: RaBitQ adversarial and edge cases — degenerate data, boundaries
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ==================================================================
+# Empty table: index creation on empty table, then search
+# ==================================================================
+statement ok
+CREATE TABLE empty_t (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX empty_idx ON empty_t USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM empty_t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+0
+
+# Insert into previously-empty RaBitQ index
+statement ok
+INSERT INTO empty_t VALUES (1, [1.0, 2.0, 3.0]::FLOAT[3]);
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM empty_t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+1
+
+statement ok
+DROP TABLE empty_t;
+
+# ==================================================================
+# Single-row table
+# ==================================================================
+statement ok
+CREATE TABLE single_t AS SELECT 1 AS id, [5.0, 5.0, 5.0]::FLOAT[3] AS vec;
+
+statement ok
+CREATE INDEX single_idx ON single_t USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT id FROM single_t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM single_t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 100
+);
+----
+1
+
+statement ok
+DROP TABLE single_t;
+
+# ==================================================================
+# All-identical vectors (centroid = every vector, residual = zero)
+# ==================================================================
+statement ok
+CREATE TABLE identical AS
+SELECT i AS id, [7.0, 7.0, 7.0]::FLOAT[3] AS vec FROM range(50) t(i);
+
+statement ok
+CREATE INDEX ident_idx ON identical USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Should return results (all at same distance)
+query I
+SELECT count(*) FROM (
+    SELECT * FROM identical ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# All distances should be equal
+query I
+SELECT count(DISTINCT array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) FROM (
+    SELECT * FROM identical ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+1
+
+statement ok
+DROP TABLE identical;
+
+# ==================================================================
+# Near-zero vectors (vectors close to origin)
+# ==================================================================
+statement ok
+CREATE TABLE nearzero AS
+SELECT i AS id,
+    array_value((i * 0.001)::FLOAT, (i * 0.002)::FLOAT, (i * 0.003)::FLOAT) AS vec
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX nz_idx ON nearzero USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Search with zero query vector
+query I
+SELECT count(*) FROM (
+    SELECT * FROM nearzero ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+statement ok
+DROP TABLE nearzero;
+
+# ==================================================================
+# Very large values (numerical stability)
+# ==================================================================
+statement ok
+CREATE TABLE big_vals AS
+SELECT i AS id,
+    array_value((i * 1000000)::FLOAT, (i * 2000000)::FLOAT, (i * 3000000)::FLOAT) AS vec
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX big_idx ON big_vals USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM big_vals ORDER BY array_distance(vec, [1000000.0, 2000000.0, 3000000.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+statement ok
+DROP TABLE big_vals;
+
+# ==================================================================
+# Very small values (near-zero, different from zero)
+# ==================================================================
+statement ok
+CREATE TABLE tiny_vals AS
+SELECT i AS id,
+    array_value((i * 0.00001)::FLOAT, (i * 0.00002)::FLOAT, (i * 0.00003)::FLOAT) AS vec
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX tiny_idx ON tiny_vals USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tiny_vals ORDER BY array_distance(vec, [0.00001, 0.00002, 0.00003]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+statement ok
+DROP TABLE tiny_vals;
+
+# ==================================================================
+# Negative values
+# ==================================================================
+statement ok
+CREATE TABLE negatives AS
+SELECT i AS id,
+    array_value((i - 50)::FLOAT, ((i - 50) * 2)::FLOAT, ((i - 50) * 3)::FLOAT) AS vec
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX neg_idx ON negatives USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM negatives ORDER BY array_distance(vec, [-10.0, -20.0, -30.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# Results return correct count
+query I
+SELECT count(*) FROM (
+    SELECT * FROM negatives
+    ORDER BY array_distance(vec, [-10.0, -20.0, -30.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+statement ok
+DROP TABLE negatives;
+
+# ==================================================================
+# LIMIT 1 (minimum useful query)
+# ==================================================================
+statement ok
+CREATE TABLE lim1 AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX lim1_idx ON lim1 USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lim1 ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 1
+);
+----
+1
+
+statement ok
+DROP TABLE lim1;
+
+# ==================================================================
+# LIMIT larger than table size
+# ==================================================================
+statement ok
+CREATE TABLE small AS
+SELECT i AS id, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec
+FROM range(10) t(i);
+
+statement ok
+CREATE INDEX small_idx ON small USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM small ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 1000
+);
+----
+10
+
+statement ok
+DROP TABLE small;
+
+# ==================================================================
+# Mixed positive/negative with filter — adversarial combo
+# ==================================================================
+statement ok
+CREATE TABLE mixed AS
+SELECT i AS id,
+    array_value((i - 250)::FLOAT, ((i * 7 - 500) % 113)::FLOAT, ((i * 3 - 200) % 97)::FLOAT) AS vec,
+    (i % 5) AS cat
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX mixed_idx ON mixed USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Filtered, negative query vector
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mixed WHERE cat = 2
+    ORDER BY array_distance(vec, [-100.0, -50.0, -25.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.cat != 2;
+----
+0
+
+statement ok
+DROP TABLE mixed;
+
+# ==================================================================
+# Filtered search on empty result set with RaBitQ
+# ==================================================================
+statement ok
+CREATE TABLE filt_empty AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS cat
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX fe_idx ON filt_empty USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM filt_empty WHERE cat = 99
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+0
+
+statement ok
+DROP TABLE filt_empty;
+
+# ==================================================================
+# TopK optimizer (MIN_BY) with RaBitQ
+# ==================================================================
+statement ok
+CREATE TABLE topk AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS cat
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX topk_idx ON topk USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) FROM topk;
+----
+5
+
+# TopK with filter
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) FROM topk WHERE cat = 1;
+----
+5
+
+statement ok
+DROP TABLE topk;
+
+# ==================================================================
+# Inner product metric with RaBitQ — functional tests
+# ==================================================================
+# RaBitQ uses L2sq for graph construction regardless of metric. For IP,
+# this means graph quality is poor (L2sq ordering ≠ IP ordering).
+# The rescore phase uses exact IP, so returned results are correctly
+# ranked among the candidates — but the candidate set may miss true
+# top-K. This is a known limitation; IP benefits less from RaBitQ
+# than L2sq or cosine.
+
+statement ok
+CREATE TABLE ip_data AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS cat
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX ip_idx ON ip_data USING HNSW (vec) WITH (metric = 'ip', quantization = 'rabitq');
+
+# Index is used
+query II
+EXPLAIN SELECT * FROM ip_data ORDER BY array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns correct count
+query I
+SELECT count(*) FROM (
+    SELECT * FROM ip_data
+    ORDER BY array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# Filtered IP
+query I
+SELECT count(*) FROM (
+    SELECT * FROM ip_data WHERE cat = 2
+    ORDER BY array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.cat != 2;
+----
+0
+
+# Results are ordered (rescore produces exact IP ordering within candidates)
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM ip_data
+    ORDER BY array_negative_inner_product(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+statement ok
+DROP TABLE ip_data;
+
+# ==================================================================
+# High dimensionality (128 dims)
+# ==================================================================
+statement ok
+SELECT setseed(0.42);
+
+statement ok
+SET lambda_syntax = 'ENABLE_SINGLE_ARROW';
+
+statement ok
+CREATE OR REPLACE MACRO rv(d) AS (list_transform(range(d), x -> random()::FLOAT));
+
+statement ok
+CREATE TABLE highdim AS
+SELECT i AS id, rv(128)::FLOAT[128] AS vec, (i % 5) AS cat
+FROM range(2000) t(i);
+
+statement ok
+CREATE INDEX hd_idx ON highdim USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Returns results
+query I
+SELECT count(*) FROM (
+    SELECT * FROM highdim
+    ORDER BY array_distance(vec, list_resize([0.5::FLOAT], 128, 0.5::FLOAT)::FLOAT[128])
+    LIMIT 10
+);
+----
+10
+
+# Filtered search at 128 dims
+query I
+SELECT count(*) FROM (
+    SELECT * FROM highdim WHERE cat = 3
+    ORDER BY array_distance(vec, list_resize([0.5::FLOAT], 128, 0.5::FLOAT)::FLOAT[128])
+    LIMIT 10
+) sub WHERE sub.cat != 3;
+----
+0
+
+# Compression is significant at 128 dims
+statement ok
+CREATE TABLE hd_mem AS
+SELECT bytes_per_vector AS bpv FROM pragma_hnsw_index_info() WHERE index_name = 'hd_idx';
+
+# RaBitQ at 128d = ceil(128/8)+8 = 24 bytes (vs 512 bytes for F32)
+query I
+SELECT bpv FROM hd_mem;
+----
+24
+
+statement ok
+DROP INDEX hd_idx;
+
+# Recall at 128 dims
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+# Brute force
+statement ok
+CREATE TABLE hd_exact AS
+SELECT id FROM highdim
+ORDER BY array_distance(vec, list_resize([0.5::FLOAT], 128, 0.5::FLOAT)::FLOAT[128])
+LIMIT 10;
+
+statement ok
+CREATE INDEX hd_idx ON highdim USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+CREATE TABLE hd_rq AS
+SELECT id FROM highdim
+ORDER BY array_distance(vec, list_resize([0.5::FLOAT], 128, 0.5::FLOAT)::FLOAT[128])
+LIMIT 10;
+
+# High-dim recall should be good
+query I
+SELECT (SELECT count(*) FROM hd_exact WHERE id IN (SELECT id FROM hd_rq)) >= 8;
+----
+true
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+statement ok
+DROP TABLE highdim;

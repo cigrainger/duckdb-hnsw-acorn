@@ -135,6 +135,12 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), bind_data.limit, context);
 	}
 
+	// For RaBitQ indexes, rescore oversampled candidates against original F32 vectors
+	if (hnsw_index.IsRaBitQ() && result->index_state) {
+		HNSWIndex::RescoreRaBitQCandidates(*result->index_state, hnsw_index,
+		                                   bind_data.table.Cast<DuckTableEntry>(), bind_data.limit, context);
+	}
+
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(result);
 	}

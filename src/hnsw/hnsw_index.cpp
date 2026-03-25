@@ -1,5 +1,8 @@
 #include "hnsw/hnsw_index.hpp"
 
+#include <algorithm>
+#include <cstring>
+
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/column_index.hpp"
@@ -35,6 +38,8 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 #include "hnsw/hnsw.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "usearch/duckdb_usearch.hpp"
 
 namespace duckdb {
@@ -188,8 +193,41 @@ HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_ty
 		}
 	}
 
-	// Create the usearch index
-	unum::usearch::metric_punned_t metric(vector_size, metric_kind, scalar_kind);
+	// Check for RaBitQ quantization option
+	auto quantization_opt = options.find("quantization");
+	if (quantization_opt != options.end()) {
+		auto q = quantization_opt->second.GetValue<string>();
+		if (StringUtil::CIEquals(q, "rabitq")) {
+			is_rabitq_ = true;
+		}
+	}
+
+	// Create the usearch metric — either standard F32 or RaBitQ
+	unum::usearch::metric_punned_t metric;
+
+	if (is_rabitq_) {
+		// Initialize RaBitQ distance context (lives as long as the index)
+		rabitq_distance_ctx_ = make_uniq<RaBitQDistanceContext>();
+		rabitq_distance_ctx_->dimensions = vector_size;
+		rabitq_distance_ctx_->binary_bytes = (vector_size + 7) / 8;
+
+		// RaBitQ always uses L2sq for graph construction/traversal.
+		// The rescore phase computes the exact distance for the original metric.
+		// L2sq on centroid-subtracted residuals is a good proxy for all metrics
+		// because it captures neighborhood structure regardless of final metric.
+		auto distance_fn = reinterpret_cast<std::uintptr_t>(&RaBitQDistanceL2sq);
+
+		metric = unum::usearch::metric_punned_t::custom(
+		    vector_size, RaBitQBytesPerVector(vector_size), distance_fn,
+		    reinterpret_cast<std::uintptr_t>(rabitq_distance_ctx_.get()), metric_kind);
+
+		// Initialize RaBitQ state (centroid will be set during construction or loaded from disk)
+		rabitq_state_ = make_uniq<RaBitQState>();
+		rabitq_state_->dimensions = vector_size;
+		rabitq_state_->original_metric = metric_kind;
+	} else {
+		metric = unum::usearch::metric_punned_t(vector_size, metric_kind, scalar_kind);
+	}
 	unum::usearch::index_dense_config_t config = {};
 
 	// We dont need to do key lookups (id -> vector) in the index, DuckDB stores the vectors separately
@@ -231,8 +269,73 @@ HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_ty
 		// Is there anything to deserialize? We could have an empty index
 		if (!info.allocator_infos[0].buffer_ids.empty()) {
 			LinkedBlockReader reader(*linked_block_allocator, root_block_ptr);
+
+			// Detect RaBitQ stream via 8-byte magic "RABITQ01". This is safe because
+			// legacy usearch streams start with [uint32 rows][uint32 cols], and the magic
+			// would require rows=0x49424152 (1.2B) AND cols=0x31305154 (825M) simultaneously.
+			static constexpr char RABITQ_MAGIC[8] = {'R', 'A', 'B', 'I', 'T', 'Q', '0', '1'};
+			char header[8] = {};
+			reader.ReadData(reinterpret_cast<data_ptr_t>(header), sizeof(header));
+
+			bool stream_is_rabitq = (std::memcmp(header, RABITQ_MAGIC, sizeof(RABITQ_MAGIC)) == 0);
+
+			if (stream_is_rabitq && !is_rabitq_) {
+				// Options didn't survive restart — reconstruct RaBitQ state
+				is_rabitq_ = true;
+				rabitq_distance_ctx_ = make_uniq<RaBitQDistanceContext>();
+				rabitq_distance_ctx_->dimensions = vector_size;
+				rabitq_distance_ctx_->binary_bytes = (vector_size + 7) / 8;
+
+				auto distance_fn = reinterpret_cast<std::uintptr_t>(&RaBitQDistanceL2sq);
+				auto rabitq_metric = unum::usearch::metric_punned_t::custom(
+				    vector_size, RaBitQBytesPerVector(vector_size), distance_fn,
+				    reinterpret_cast<std::uintptr_t>(rabitq_distance_ctx_.get()), metric_kind);
+
+				rabitq_state_ = make_uniq<RaBitQState>();
+				rabitq_state_->dimensions = vector_size;
+				rabitq_state_->original_metric = metric_kind;
+
+				index = unum::usearch::index_dense_gt<row_t>::make(rabitq_metric, config);
+			}
+
+			if (stream_is_rabitq) {
+				uint64_t centroid_dims = 0;
+				reader.ReadData(reinterpret_cast<data_ptr_t>(&centroid_dims), sizeof(centroid_dims));
+				if (centroid_dims != vector_size) {
+					throw InternalException("RaBitQ centroid dimensions mismatch: expected %llu, got %llu",
+					                        vector_size, centroid_dims);
+				}
+				rabitq_state_->centroid.resize(centroid_dims);
+				reader.ReadData(reinterpret_cast<data_ptr_t>(rabitq_state_->centroid.data()),
+				                centroid_dims * sizeof(float));
+			}
+
+			// Load usearch stream. For legacy format, inject the consumed 8 header bytes back.
+			bool inject_header = !stream_is_rabitq;
+			idx_t header_offset = 0;
+			USearchIndexType::serialization_config_t sconfig;
+			sconfig.preserve_metric = is_rabitq_;
+
 			index.load_from_stream(
-			    [&](void *data, size_t size) { return size == reader.ReadData(static_cast<data_ptr_t>(data), size); });
+			    [&](void *data, size_t size) -> bool {
+				    if (inject_header) {
+					    auto ptr = static_cast<data_ptr_t>(data);
+					    idx_t to_inject = MinValue(static_cast<idx_t>(sizeof(header)) - header_offset,
+					                               static_cast<idx_t>(size));
+					    std::memcpy(ptr, header + header_offset, to_inject);
+					    header_offset += to_inject;
+					    if (header_offset >= sizeof(header)) {
+						    inject_header = false;
+					    }
+					    if (to_inject == size) {
+						    return true;
+					    }
+					    auto remaining = size - to_inject;
+					    return remaining == reader.ReadData(ptr + to_inject, remaining);
+				    }
+				    return size == reader.ReadData(static_cast<data_ptr_t>(data), size);
+			    },
+			    sconfig);
 		}
 	} else {
 		index.reserve(MinValue(static_cast<idx_t>(32), estimated_cardinality));
@@ -310,14 +413,16 @@ struct HNSWIndexScanState : public IndexScanState {
 	idx_t current_row = 0;
 	idx_t total_rows = 0;
 	unique_array<row_t> row_ids = nullptr;
+
+	// RaBitQ rescore fields
+	bool needs_rescore = false;
+	unique_array<float> query_vector;
+	idx_t vector_dimensions = 0;
+	unum::usearch::metric_kind_t metric_kind = unum::usearch::metric_kind_t::l2sq_k;
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
-	auto state = make_uniq<HNSWIndexScanState>();
-
-	// Try to get the ef_search parameter from the database or use the default value
-	auto ef_search = index.expansion_search();
-
+static idx_t GetEfSearch(const HNSWIndex &hnsw_index, ClientContext &context) {
+	auto ef_search = hnsw_index.index.expansion_search();
 	Value hnsw_ef_search_opt;
 	if (context.TryGetCurrentSetting("hnsw_ef_search", hnsw_ef_search_opt)) {
 		if (!hnsw_ef_search_opt.IsNull() && hnsw_ef_search_opt.type() == LogicalType::BIGINT) {
@@ -327,33 +432,76 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 			}
 		}
 	}
+	return ef_search;
+}
 
-	// Acquire a shared lock to search the index
+static idx_t GetRaBitQOversample(ClientContext &context) {
+	idx_t oversample = 3;
+	Value oversample_opt;
+	if (context.TryGetCurrentSetting("hnsw_rabitq_oversample", oversample_opt)) {
+		if (!oversample_opt.IsNull()) {
+			auto val = oversample_opt.GetValue<int64_t>();
+			if (val > 0) {
+				oversample = static_cast<idx_t>(val);
+			}
+		}
+	}
+	return oversample;
+}
+
+unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+	auto state = make_uniq<HNSWIndexScanState>();
+	auto ef_search = GetEfSearch(*this, context);
+
 	auto lock = rwlock.GetSharedLock();
-	auto search_result = index.ef_search(query_vector, limit, ef_search);
 
-	state->current_row = 0;
-	state->total_rows = search_result.size();
-	state->row_ids = make_uniq_array<row_t>(search_result.size());
+	if (is_rabitq_) {
+		// RaBitQ path: quantize query, oversample, mark for rescore
+		auto oversample = GetRaBitQOversample(context);
+		auto search_limit = limit * oversample;
+		bool normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
 
-	search_result.dump_to(state->row_ids.get());
+		// Quantize query vector
+		auto bbq_size = RaBitQBytesPerVector(rabitq_state_->dimensions);
+		auto bbq_query = make_uniq_array<uint8_t>(bbq_size);
+		RaBitQQuantizeVector(query_vector, *rabitq_state_, bbq_query.get(), normalize);
+
+		auto search_result =
+		    index.ef_search(reinterpret_cast<const unum::usearch::b1x8_t *>(bbq_query.get()), search_limit, ef_search);
+
+		state->current_row = 0;
+		state->total_rows = search_result.size();
+		state->row_ids = make_uniq_array<row_t>(search_result.size());
+		search_result.dump_to(state->row_ids.get());
+
+		// Store info for rescore
+		state->needs_rescore = true;
+		state->vector_dimensions = rabitq_state_->dimensions;
+		state->metric_kind = rabitq_state_->original_metric;
+		state->query_vector = make_uniq_array<float>(rabitq_state_->dimensions);
+		memcpy(state->query_vector.get(), query_vector, rabitq_state_->dimensions * sizeof(float));
+	} else {
+		auto search_result = index.ef_search(query_vector, limit, ef_search);
+
+		state->current_row = 0;
+		state->total_rows = search_result.size();
+		state->row_ids = make_uniq_array<row_t>(search_result.size());
+		search_result.dump_to(state->row_ids.get());
+	}
+
 	return std::move(state);
 }
 
 unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector, idx_t limit,
                                                              vector<uint64_t> filter_bitset, ClientContext &context) {
 	auto state = make_uniq<HNSWIndexScanState>();
+	auto ef_search = GetEfSearch(*this, context);
 
-	// Get ef_search parameter
-	auto ef_search = index.expansion_search();
-	Value hnsw_ef_search_opt;
-	if (context.TryGetCurrentSetting("hnsw_ef_search", hnsw_ef_search_opt)) {
-		if (!hnsw_ef_search_opt.IsNull() && hnsw_ef_search_opt.type() == LogicalType::BIGINT) {
-			auto val = hnsw_ef_search_opt.GetValue<int64_t>();
-			if (val > 0) {
-				ef_search = static_cast<idx_t>(val);
-			}
-		}
+	// For RaBitQ, oversample the limit for the search phase
+	auto search_limit = limit;
+	if (is_rabitq_) {
+		auto oversample = GetRaBitQOversample(context);
+		search_limit = limit * oversample;
 	}
 
 	// Compute selectivity from bitset
@@ -411,32 +559,59 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector
 	// needs to explore more candidates to find enough matching rows.
 	// Scale inversely with selectivity, capped at index size.
 	if (selectivity > 0.0f && selectivity < 1.0f) {
-		auto needed = static_cast<idx_t>(static_cast<float>(limit * 2) / selectivity);
+		auto needed = static_cast<idx_t>(static_cast<float>(search_limit * 2) / selectivity);
 		if (needed > ef_search) {
 			ef_search = (needed < index.size()) ? needed : static_cast<idx_t>(index.size());
 		}
 	}
 
+	// For RaBitQ, quantize the query vector before searching
+	unique_array<uint8_t> rabitq_query;
+	if (is_rabitq_) {
+		auto bbq_size = RaBitQBytesPerVector(rabitq_state_->dimensions);
+		rabitq_query = make_uniq_array<uint8_t>(bbq_size);
+		bool normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
+		RaBitQQuantizeVector(query_vector, *rabitq_state_, rabitq_query.get(), normalize);
+	}
+
 	auto lock = rwlock.GetSharedLock();
 
 	USearchIndexType::search_result_t search_result;
-	if (selectivity > acorn_threshold) {
-		// High selectivity: standard HNSW search (post-filter handles the rest)
-		search_result = index.ef_search(query_vector, limit, ef_search);
-	} else if (popcount > 0 && selectivity < bruteforce_threshold) {
-		// Very low selectivity: brute-force exact scan over all matching rows
-		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate,
-		                                                /*thread=*/0, /*exact=*/true);
+	if (is_rabitq_) {
+		auto bbq_ptr = reinterpret_cast<const unum::usearch::b1x8_t *>(rabitq_query.get());
+		if (selectivity > acorn_threshold) {
+			search_result = index.ef_search(bbq_ptr, search_limit, ef_search);
+		} else if (popcount > 0 && selectivity < bruteforce_threshold) {
+			search_result = index.ef_acorn1_filtered_search(bbq_ptr, search_limit, ef_search, predicate,
+			                                                /*thread=*/0, /*exact=*/true);
+		} else {
+			search_result = index.ef_acorn1_filtered_search(bbq_ptr, search_limit, ef_search, predicate);
+		}
 	} else {
-		// Medium selectivity: ACORN-1 filtered search with two-hop expansion
-		search_result = index.ef_acorn1_filtered_search(query_vector, limit, ef_search, predicate);
+		if (selectivity > acorn_threshold) {
+			search_result = index.ef_search(query_vector, search_limit, ef_search);
+		} else if (popcount > 0 && selectivity < bruteforce_threshold) {
+			search_result = index.ef_acorn1_filtered_search(query_vector, search_limit, ef_search, predicate,
+			                                                /*thread=*/0, /*exact=*/true);
+		} else {
+			search_result = index.ef_acorn1_filtered_search(query_vector, search_limit, ef_search, predicate);
+		}
 	}
 
 	state->current_row = 0;
 	state->total_rows = search_result.size();
 	state->row_ids = make_uniq_array<row_t>(search_result.size());
-
 	search_result.dump_to(state->row_ids.get());
+
+	// For RaBitQ, mark for rescore with original query
+	if (is_rabitq_) {
+		state->needs_rescore = true;
+		state->vector_dimensions = rabitq_state_->dimensions;
+		state->metric_kind = rabitq_state_->original_metric;
+		state->query_vector = make_uniq_array<float>(rabitq_state_->dimensions);
+		memcpy(state->query_vector.get(), query_vector, rabitq_state_->dimensions * sizeof(float));
+	}
+
 	return std::move(state);
 }
 
@@ -486,7 +661,19 @@ idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, 
 	USearchIndexType::search_result_t search_result;
 	{
 		auto lock = rwlock.GetSharedLock();
-		search_result = index.ef_search(query_vector, limit, state.ef_search);
+		if (is_rabitq_) {
+			// Quantize query and search with b1x8 overload
+			auto bbq_size = RaBitQBytesPerVector(rabitq_state_->dimensions);
+			auto bbq_query = make_uniq_array<uint8_t>(bbq_size);
+			bool normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
+			RaBitQQuantizeVector(query_vector, *rabitq_state_, bbq_query.get(), normalize);
+			// No oversample/rescore in join path — the join operator handles batching
+			// and doesn't support per-query rescore yet. Use higher ef_search instead.
+			search_result = index.ef_search(
+			    reinterpret_cast<const unum::usearch::b1x8_t *>(bbq_query.get()), limit, state.ef_search);
+		} else {
+			search_result = index.ef_search(query_vector, limit, state.ef_search);
+		}
 	}
 
 	const auto offset = state.row_ids.size();
@@ -505,6 +692,93 @@ const Vector &HNSWIndex::GetMultiScanResult(IndexScanState &state) {
 void HNSWIndex::ResetMultiScan(IndexScanState &state) {
 	auto &scan_state = state.Cast<MultiScanState>();
 	scan_state.row_ids.clear();
+}
+
+void HNSWIndex::SetRaBitQCentroid(vector<float> centroid) {
+	D_ASSERT(is_rabitq_);
+	D_ASSERT(rabitq_state_);
+	// The centroid is computed once during bulk index construction and never updated.
+	// Vectors inserted later are quantized against this centroid. As data distribution
+	// shifts, graph traversal quality may degrade, but the rescore phase mitigates
+	// this for final results. A full index rebuild recomputes the centroid.
+	rabitq_state_->centroid = std::move(centroid);
+}
+
+void HNSWIndex::RescoreRaBitQCandidates(IndexScanState &index_state, const HNSWIndex &hnsw_index,
+                                         DuckTableEntry &table, idx_t limit, ClientContext &context) {
+	auto &scan_state = index_state.Cast<HNSWIndexScanState>();
+	if (!scan_state.needs_rescore || scan_state.total_rows == 0) {
+		return;
+	}
+
+	auto &data_table = table.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, table.catalog);
+
+	auto dims = scan_state.vector_dimensions;
+	auto candidate_count = scan_state.total_rows;
+	auto final_limit = MinValue(limit, candidate_count);
+
+	// Get the vector column's storage index
+	auto vec_col_id = hnsw_index.GetColumnIds()[0];
+	vector<StorageIndex> fetch_col_ids = {StorageIndex(vec_col_id)};
+
+	// Build a row_id vector for fetching
+	Vector candidate_rowids(LogicalType::ROW_TYPE, candidate_count);
+	auto rid_data = FlatVector::GetData<row_t>(candidate_rowids);
+	memcpy(rid_data, scan_state.row_ids.get(), candidate_count * sizeof(row_t));
+
+	// Fetch original F32 vectors for all candidates
+	DataChunk fetched;
+	fetched.Initialize(Allocator::DefaultAllocator(), hnsw_index.logical_types);
+	ColumnFetchState fetch_state;
+	data_table.Fetch(transaction, fetched, fetch_col_ids, candidate_rowids, candidate_count, fetch_state);
+
+	// Compute exact distances
+	auto &vec_vec = fetched.data[0];
+	auto &vec_child = ArrayVector::GetEntry(vec_vec);
+	auto vec_data = FlatVector::GetData<float>(vec_child);
+	auto query = scan_state.query_vector.get();
+
+	// Choose exact distance function based on metric
+	using dist_fn_t = float (*)(const float *, const float *, idx_t);
+	dist_fn_t dist_fn;
+	switch (scan_state.metric_kind) {
+	case unum::usearch::metric_kind_t::cos_k:
+		dist_fn = ExactDistanceCosine;
+		break;
+	case unum::usearch::metric_kind_t::ip_k:
+		dist_fn = ExactDistanceIP;
+		break;
+	default:
+		dist_fn = ExactDistanceL2sq;
+		break;
+	}
+
+	// Compute distances and build (distance, index) pairs
+	struct DistIdx {
+		float distance;
+		idx_t idx;
+	};
+	vector<DistIdx> scored(candidate_count);
+	for (idx_t i = 0; i < candidate_count; i++) {
+		scored[i].distance = dist_fn(query, vec_data + i * dims, dims);
+		scored[i].idx = i;
+	}
+
+	// Partial sort to get top-K
+	std::partial_sort(scored.begin(), scored.begin() + final_limit, scored.end(),
+	                  [](const DistIdx &a, const DistIdx &b) { return a.distance < b.distance; });
+
+	// Replace scan state with rescored top-K
+	auto new_row_ids = make_uniq_array<row_t>(final_limit);
+	for (idx_t i = 0; i < final_limit; i++) {
+		new_row_ids[i] = scan_state.row_ids[scored[i].idx];
+	}
+
+	scan_state.row_ids = std::move(new_row_ids);
+	scan_state.total_rows = final_limit;
+	scan_state.current_row = 0;
+	scan_state.needs_rescore = false;
 }
 
 void HNSWIndex::CommitDrop(IndexLock &index_lock) {
@@ -563,14 +837,30 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 	{
 		// Now we can be sure that we have enough space in the index
 		auto lock = rwlock.GetSharedLock();
+
+		// Pre-allocate quantization buffer outside the loop (reused per vector)
+		unique_array<uint8_t> rabitq_buf;
+		bool rabitq_normalize = false;
+		if (is_rabitq_ && rabitq_state_) {
+			rabitq_buf = make_uniq_array<uint8_t>(RaBitQBytesPerVector(rabitq_state_->dimensions));
+			rabitq_normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
+		}
+
 		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
 			if (FlatVector::IsNull(vec_vec, out_idx)) {
-				// Dont add nulls
 				continue;
 			}
 
 			auto rowid = rowid_data[out_idx];
-			auto result = index.add(rowid, vec_child_data + (out_idx * array_size), thread_idx);
+			USearchIndexType::add_result_t result;
+			if (rabitq_buf) {
+				RaBitQQuantizeVector(vec_child_data + (out_idx * array_size), *rabitq_state_, rabitq_buf.get(),
+				                     rabitq_normalize);
+				result = index.add(rowid, reinterpret_cast<const unum::usearch::b1x8_t *>(rabitq_buf.get()),
+				                   thread_idx);
+			} else {
+				result = index.add(rowid, vec_child_data + (out_idx * array_size), thread_idx);
+			}
 			if (!result) {
 				throw InternalException("Failed to add to the HNSW index: %s", result.error.what());
 			}
@@ -645,6 +935,18 @@ void HNSWIndex::PersistToDisk() {
 
 	LinkedBlockWriter writer(*linked_block_allocator, root_block_ptr);
 	writer.Reset();
+
+	// For RaBitQ indexes, write 8-byte magic + centroid before the usearch stream.
+	if (is_rabitq_ && rabitq_state_) {
+		static constexpr char RABITQ_MAGIC[8] = {'R', 'A', 'B', 'I', 'T', 'Q', '0', '1'};
+		writer.WriteData(reinterpret_cast<const_data_ptr_t>(RABITQ_MAGIC), sizeof(RABITQ_MAGIC));
+
+		uint64_t centroid_dims = rabitq_state_->dimensions;
+		writer.WriteData(reinterpret_cast<const_data_ptr_t>(&centroid_dims), sizeof(centroid_dims));
+		writer.WriteData(reinterpret_cast<const_data_ptr_t>(rabitq_state_->centroid.data()),
+		                 centroid_dims * sizeof(float));
+	}
+
 	index.save_to_stream([&](const void *data, size_t size) {
 		writer.WriteData(static_cast<const_data_ptr_t>(data), size);
 		return true;
@@ -829,6 +1131,11 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	db.config.AddExtensionOption("hnsw_bruteforce_threshold",
 	                             "selectivity below which brute-force exact scan is used instead of ACORN-1",
 	                             LogicalType::FLOAT, Value::FLOAT(0.01f));
+
+	// RaBitQ quantization settings
+	db.config.AddExtensionOption("hnsw_rabitq_oversample",
+	                             "rescore oversample factor for RaBitQ-quantized HNSW indexes (default 3)",
+	                             LogicalType::BIGINT, Value::BIGINT(3));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

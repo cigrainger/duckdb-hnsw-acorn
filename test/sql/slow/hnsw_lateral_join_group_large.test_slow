@@ -1,7 +1,7 @@
 # name: test/sql/slow/hnsw_lateral_join_group_large.test_slow
 # group: [slow]
 
-require vss
+require hnsw_acorn
 
 statement ok
 SELECT setseed(0.1337);

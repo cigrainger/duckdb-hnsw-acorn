@@ -1,0 +1,130 @@
+# name: test/sql/hnsw/hnsw_rabitq_options.test
+# description: RaBitQ option validation — sad path and boundary cases
+# group: [hnsw]
+
+require hnsw_acorn
+
+statement ok
+CREATE TABLE t (id INT, vec FLOAT[3]);
+
+# ==================================================================
+# Invalid quantization values
+# ==================================================================
+
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'invalid');
+----
+must be 'rabitq' or 'none'
+
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'bbq');
+----
+must be 'rabitq' or 'none'
+
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = '');
+----
+must be 'rabitq' or 'none'
+
+# Wrong type for quantization
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 42);
+----
+must be a string
+
+# ==================================================================
+# Case insensitivity
+# ==================================================================
+
+statement ok
+CREATE INDEX idx_upper ON t USING HNSW (vec) WITH (quantization = 'RABITQ');
+
+statement ok
+DROP INDEX idx_upper;
+
+statement ok
+CREATE INDEX idx_mixed ON t USING HNSW (vec) WITH (quantization = 'RaBitQ');
+
+statement ok
+DROP INDEX idx_mixed;
+
+# ==================================================================
+# RaBitQ + invalid HNSW options
+# ==================================================================
+
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'rabitq', M = 0);
+----
+must be at least 2
+
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'rabitq', ef_construction = -1);
+----
+must be at least 1
+
+# Unknown option alongside quantization
+statement error
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'rabitq', bogus = 42);
+----
+Unknown option
+
+# ==================================================================
+# hnsw_rabitq_oversample setting
+# ==================================================================
+
+statement ok
+INSERT INTO t SELECT i, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) FROM range(100) r(i);
+
+statement ok
+CREATE INDEX idx ON t USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Default oversample (3)
+query I
+SELECT count(*) FROM (
+    SELECT * FROM t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# Set oversample to 1 (minimum useful — no oversampling, rescore still runs)
+statement ok
+SET hnsw_rabitq_oversample = 1;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# Set oversample to 10 (high oversample — should still work)
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# Reset
+statement ok
+RESET hnsw_rabitq_oversample;
+
+# Oversample interacts with ef_search override
+statement ok
+SET hnsw_ef_search = 50;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM t ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+statement ok
+RESET hnsw_ef_search;
+
+statement ok
+DROP INDEX idx;

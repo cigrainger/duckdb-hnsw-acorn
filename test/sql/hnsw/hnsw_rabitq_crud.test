@@ -1,0 +1,133 @@
+# name: test/sql/hnsw/hnsw_rabitq_crud.test
+# description: RaBitQ index behavior under inserts and deletes
+# group: [hnsw]
+
+require hnsw_acorn
+
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# ==================================================================
+# Baseline: search works before any mutations
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# ==================================================================
+# Insert: bulk insert of 200 new rows
+# ==================================================================
+statement ok
+INSERT INTO items
+SELECT i + 500 AS id,
+    array_value(((i + 500) % 10)::FLOAT, (((i + 500) * 7) % 13)::FLOAT, (((i + 500) * 3) % 17)::FLOAT) AS vec,
+    ((i + 500) % 5) AS category
+FROM range(200) t(i);
+
+# Search returns results after insert
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Filtered search still correct after insert
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 3
+    ORDER BY array_distance(vec, [5.0, 6.0, 7.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 3;
+----
+0
+
+# ==================================================================
+# Delete: remove first 100 rows
+# ==================================================================
+statement ok
+DELETE FROM items WHERE id < 100;
+
+# Search still works after delete
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Deleted rows never appear in results
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 50
+) sub WHERE sub.id < 100;
+----
+0
+
+# Filtered search after delete — no deleted rows, filter still holds
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_distance(vec, [2.0, 3.0, 4.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 0;
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_distance(vec, [2.0, 3.0, 4.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.id < 100;
+----
+0
+
+# ==================================================================
+# Mixed insert + delete sequence
+# ==================================================================
+
+# Insert one row
+statement ok
+INSERT INTO items VALUES (9999, array_value(1.0, 1.0, 1.0), 0);
+
+# Delete another batch
+statement ok
+DELETE FROM items WHERE id BETWEEN 200 AND 250;
+
+# Search still works
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 1.0, 1.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Deleted rows gone
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 1.0, 1.0]::FLOAT[3]) LIMIT 100
+) sub WHERE sub.id BETWEEN 200 AND 250;
+----
+0
+
+# Clean up
+statement ok
+DELETE FROM items WHERE id = 9999;
+
+# ==================================================================
+# After deletions, search still returns correct count
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [3.0, 4.0, 5.0]::FLOAT[3]) LIMIT 5
+);
+----
+5

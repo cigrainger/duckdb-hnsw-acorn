@@ -132,6 +132,7 @@ struct index_dense_clustering_config_t {
 struct index_dense_serialization_config_t {
     bool exclude_vectors = false;
     bool use_64_bit_dimensions = false;
+    bool preserve_metric = false; // Skip metric rebuild on load (for custom metrics like RaBitQ)
 };
 
 struct index_dense_copy_config_t : public index_copy_config_t {
@@ -632,6 +633,7 @@ class index_dense_gt {
     template <typename predicate_at> search_result_t ef_filtered_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, ef_search); }
 
     // ACORN-1 filtered search: two-hop expansion for better recall under selective predicates
+    template <typename predicate_at> search_result_t ef_acorn1_filtered_search(b1x8_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_acorn1_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_b1x8, ef_search); }
     template <typename predicate_at> search_result_t ef_acorn1_filtered_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_acorn1_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, ef_search); }
 
     std::size_t get(vector_key_t key, b1x8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_b1x8); }
@@ -962,9 +964,11 @@ class index_dense_gt {
                 return result.failed("Slot type doesn't match, consider rebuilding");
 
             config_.multi = head.multi;
-            metric_ = metric_t::builtin(head.dimensions, head.kind_metric, head.kind_scalar);
+            if (!config.preserve_metric) {
+                metric_ = metric_t::builtin(head.dimensions, head.kind_metric, head.kind_scalar);
+                casts_ = make_casts_(head.kind_scalar);
+            }
             cast_buffer_.resize(available_threads_.size() * metric_.bytes_per_vector());
-            casts_ = make_casts_(head.kind_scalar);
         }
 
         // Pull the actual proximity graph
