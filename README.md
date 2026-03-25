@@ -1,58 +1,98 @@
 # DuckDB-HNSW-ACORN
 
-> **This is a fork of [duckdb/duckdb-vss](https://github.com/duckdb/duckdb-vss) that adds ACORN-1 filtered HNSW search.**
->
-> The upstream extension has a critical limitation: `WHERE` clauses are applied *after* the HNSW index returns results, so `SELECT ... WHERE category = 'X' ORDER BY distance LIMIT 10` often returns fewer than 10 rows. This fork pushes filter predicates *into* the HNSW graph traversal using the [ACORN-1 algorithm](https://arxiv.org/abs/2403.04871), ensuring filtered queries return the correct number of results with high recall.
->
-> **What changed:**
-> - Filter predicates are evaluated during HNSW graph traversal, not after
-> - ACORN-1 two-hop expansion through failed neighbors recovers graph connectivity under selective filtering
-> - Selectivity-based strategy switching: >60% selectivity uses post-filter, 1-60% uses ACORN-1, <1% uses brute-force exact scan
-> - Per-node expansion threshold (Lucene's 90% rule) skips two-hop when the neighborhood is already well-connected
-> - Configurable thresholds: `SET hnsw_acorn_threshold = 0.6` and `SET hnsw_bruteforce_threshold = 0.01`
->
-> **Benchmark (228k movies, 768-dim Nomic embeddings):**
-> | Filter | Selectivity | Upstream | ACORN-1 |
-> |---|---|---|---|
-> | English only | ~60% | ~10/10 | **10/10** |
-> | Japanese only | ~3% | 0-1/10 | **10/10** |
-> | Korean only | ~1% | 0/10 | **10/10** |
-> | Rating >= 8.0 | ~5% | 0/10 | **10/10** |
->
-> Query: movies similar to *The Matrix*, filtered by language → returns *Matrix Revolutions*, *Gunhed* (ja), *Savior of the Earth* (ko).
-> See [`test/benchmark/movies_real_benchmark.sql`](test/benchmark/movies_real_benchmark.sql) for the full benchmark.
+A DuckDB extension for vector similarity search with **filtered HNSW** (ACORN-1) and **RaBitQ binary quantization**.
 
----
+Fork of [duckdb/duckdb-vss](https://github.com/duckdb/duckdb-vss).
 
-*Original README follows.*
+## Why this fork?
 
----
+The upstream `duckdb-vss` extension has two limitations:
 
-# DuckDB-VSS
+1. **Filtered search is broken.** `WHERE` clauses are applied *after* the HNSW index returns results, so `SELECT ... WHERE category = 'X' ORDER BY distance LIMIT 10` often returns fewer than 10 rows.
+2. **No vector compression.** Every vector is stored as full F32, so the index memory scales linearly with dimensions.
 
-Vector Similarity Search for DuckDB
+This fork fixes both:
 
-This is an experimental extension for DuckDB that adds indexing support to accelerate Vector Similarity Search using DuckDB's new fixed-size `ARRAY` type added in version v0.10.0.
-This extension is based on the [usearch](https://github.com/unum-cloud/usearch) library and serves as a proof of concept for providing a custom index type, in this case a HNSW index, from within an extension and exposing it to DuckDB.
+- **ACORN-1 filtered search** pushes filter predicates *into* HNSW graph traversal, ensuring filtered queries return the correct number of results.
+- **RaBitQ quantization** compresses vectors to 1 bit per dimension (~21x memory reduction at 128 dims) with a rescore phase that preserves result quality.
 
-## Filtered Search (ACORN-1)
-
-This fork adds support for filtered vector search. Queries with `WHERE` clauses now push filter predicates into the HNSW index traversal:
+## Quick start
 
 ```sql
--- This now returns exactly 10 results with category = 'X',
--- ordered by distance. Upstream would return 0-2 results.
-SELECT * FROM my_table
+-- Create a table with vectors
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value(random(), random(), random())::FLOAT[3] AS vec,
+    (i % 5) AS category
+FROM range(10000) t(i);
+
+-- Standard HNSW index
+CREATE INDEX idx ON items USING HNSW (vec);
+
+-- Nearest neighbor search
+SELECT * FROM items ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT 10;
+
+-- Filtered search (returns exactly 10 results matching the filter)
+SELECT * FROM items
+WHERE category = 1
+ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+```
+
+No special syntax — the optimizer detects `WHERE` + `ORDER BY distance` + `LIMIT` and uses filtered HNSW search automatically.
+
+## RaBitQ quantization
+
+For large-dimension vectors (128+), RaBitQ dramatically reduces index memory:
+
+```sql
+CREATE INDEX idx ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+```
+
+Everything else works identically — queries, filters, persistence. The index stores binary-quantized vectors and rescores candidates against the original F32 vectors for exact ranking.
+
+| Metric | 128 dims | 256 dims | 768 dims |
+|--------|----------|----------|----------|
+| F32 bytes/vec | 512 | 1024 | 3072 |
+| RaBitQ bytes/vec | 24 | 40 | 104 |
+| **Compression** | **21x** | **26x** | **30x** |
+
+### Configuration
+
+```sql
+-- Oversample factor: search N*oversample candidates, rescore to top-N (default 3)
+SET hnsw_rabitq_oversample = 10;
+```
+
+Higher oversample = better recall, slightly slower queries.
+
+### Benchmark (10K rows, 128 dims, L2sq)
+
+| Method | Recall@10 | Vec Memory | Compression |
+|--------|-----------|------------|-------------|
+| HNSW | 66.7% | 5000 KB | — |
+| RaBitQ 3x | 66.7% | 234 KB | 21.3x |
+| RaBitQ 10x | 83.3% | 234 KB | 21.3x |
+
+RaBitQ 10x achieves higher recall than plain HNSW because the rescore phase reranks with exact distances.
+
+Run the benchmark yourself: `./build/release/duckdb < benchmarks/rabitq_benchmark.sql`
+
+## Filtered search (ACORN-1)
+
+Filter predicates are evaluated during HNSW graph traversal using the [ACORN-1 algorithm](https://arxiv.org/abs/2403.04871):
+
+```sql
+SELECT * FROM items
 WHERE category = 'X'
 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3])
 LIMIT 10;
 ```
 
-No special syntax required — the optimizer automatically detects `WHERE` + `ORDER BY distance` + `LIMIT` patterns and uses filtered HNSW search.
+Prepared statements work for parameterized queries:
 
-Prepared statements work for parameterized query vectors:
 ```sql
-PREPARE search AS SELECT * FROM my_table
+PREPARE search AS SELECT * FROM items
 WHERE category = $2
 ORDER BY array_distance(vec, $1::FLOAT[3])
 LIMIT 10;
@@ -60,112 +100,106 @@ LIMIT 10;
 EXECUTE search([1,2,3], 'X');
 ```
 
-> **Note:** Subquery query vectors (`ORDER BY distance(vec, (SELECT q FROM ...))`) currently fall back to sequential scan. Use prepared statements or literal vectors instead.
+### Selectivity-based strategy
 
-### Configuration
+| Selectivity | Strategy |
+|-------------|----------|
+| >60% | Standard HNSW (post-filter) |
+| 1–60% | ACORN-1 (two-hop expansion) |
+| <1% | Brute-force exact scan |
+
+Thresholds are configurable:
 
 ```sql
--- Selectivity above which ACORN-1 is skipped (default 0.6 = 60%)
-SET hnsw_acorn_threshold = 0.6;
-
--- Selectivity below which brute-force exact scan is used (default 0.01 = 1%)
-SET hnsw_bruteforce_threshold = 0.01;
+SET hnsw_acorn_threshold = 0.6;        -- default
+SET hnsw_bruteforce_threshold = 0.01;  -- default
 ```
 
-## Usage
+### Filtered search benchmark (228K movies, 768-dim)
 
-To create a new HNSW index on a table with an `ARRAY` column, use the `CREATE INDEX` statement with the `USING HNSW` clause. For example:
+| Filter | Selectivity | Upstream | ACORN-1 |
+|--------|-------------|----------|---------|
+| English only | ~60% | ~10/10 | **10/10** |
+| Japanese only | ~3% | 0–1/10 | **10/10** |
+| Korean only | ~1% | 0/10 | **10/10** |
+| Rating >= 8.0 | ~5% | 0/10 | **10/10** |
+
+## Distance metrics
+
+| Metric | Option | Function | Operator |
+|--------|--------|----------|----------|
+| Euclidean (L2sq) | `l2sq` (default) | `array_distance` | `<->` |
+| Cosine | `cosine` | `array_cosine_distance` | `<=>` |
+| Inner product | `ip` | `array_negative_inner_product` | — |
+
 ```sql
-CREATE TABLE my_vector_table (vec FLOAT[3]);
-INSERT INTO my_vector_table SELECT array_value(a,b,c) FROM range(1,10) ra(a), range(1,10) rb(b), range(1,10) rc(c);
-CREATE INDEX my_hnsw_index ON my_vector_table USING HNSW (vec);
+CREATE INDEX my_idx ON items USING HNSW (vec) WITH (metric = 'cosine');
+CREATE INDEX my_idx ON items USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
 ```
 
-The index will then be used to accelerate queries that use a `ORDER BY` clause evaluating one of the supported distance metric functions against the indexed columns and a constant vector, followed by a `LIMIT` clause. For example:
+## Index options
+
 ```sql
-SELECT * FROM my_vector_table ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 3;
-
-# We can verify that the index is being used by checking the EXPLAIN output 
-# and looking for the HNSW_INDEX_SCAN node in the plan
-
-EXPLAIN SELECT * FROM my_vector_table ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 3;
-
-┌───────────────────────────┐
-│         PROJECTION        │
-│   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-│             #0            │
-└─────────────┬─────────────┘                             
-┌─────────────┴─────────────┐
-│         PROJECTION        │
-│   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-│            vec            │
-│array_distance(vec, [1.0, 2│
-│         .0, 3.0])         │
-└─────────────┬─────────────┘                             
-┌─────────────┴─────────────┐
-│      HNSW_INDEX_SCAN      │
-│   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-│   t1 (HNSW INDEX SCAN :   │
-│           my_idx)         │
-│   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-│            vec            │
-│   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-│           EC: 3           │
-└───────────────────────────┘               
+CREATE INDEX idx ON items USING HNSW (vec) WITH (
+    metric = 'l2sq',           -- distance metric (l2sq, cosine, ip)
+    quantization = 'rabitq',   -- vector quantization (rabitq, none)
+    ef_construction = 200,     -- graph construction search width
+    ef_search = 200,           -- query-time search width
+    M = 16,                    -- max connections per node
+    M0 = 32                    -- max connections at layer 0
+);
 ```
 
-By default the HNSW index will be created using the euclidean distance `l2sq` (L2-norm squared) metric, matching DuckDBs `array_distance` function, but other distance metrics can be used by specifying the `metric` option during index creation. For example:
+Runtime settings:
+
 ```sql
-CREATE INDEX my_hnsw_cosine_index ON my_vector_table USING HNSW (vec) WITH (metric = 'cosine');
+SET hnsw_ef_search = 100;              -- override ef_search at query time
+SET hnsw_rabitq_oversample = 10;       -- RaBitQ rescore oversample factor
+SET hnsw_acorn_threshold = 0.6;        -- ACORN-1 selectivity threshold
+SET hnsw_bruteforce_threshold = 0.01;  -- brute-force selectivity threshold
 ```
 
-The following table shows the supported distance metrics and their corresponding DuckDB functions
+## Index inspection
 
-| Description | Metric | Function                       |
-| --- | --- |--------------------------------|
-| Euclidean distance | `l2sq` | `array_distance`               |
-| Cosine similarity | `cosine` | `array_cosine_distance`        |
-| Inner product | `ip` | `array_negative_inner_product` |
+```sql
+SELECT * FROM pragma_hnsw_index_info();
+```
 
-## Inserts, Updates,  Deletes and Re-Compaction
+Returns: index name, table, metric, dimensions, count, capacity, memory usage, quantization type, bytes per vector, vector memory usage, levels, and per-level statistics.
 
-The HNSW index does support inserting, updating and deleting rows from the table after index creation. However, there are two things to keep in mind:  
-- Its faster to create the index after the table has been populated with data as the initial bulk load can make better use of parallelism on large tables.
-- Deletes are not immediately reflected in the index, but are instead "marked" as deleted, which can cause the index to grow stale over time and negatively impact query quality and performance.
+## Inserts, updates, deletes
 
-To address this, you can call the `PRAGMA hnsw_compact_index('<index name>')` pragma function to trigger a re-compaction of the index pruning deleted items, or re-create the index after a significant number of updates.
+The index supports mutations after creation. For best performance, create the index after bulk loading data.
 
-## Limitations 
+Deletes are lazily marked — run `PRAGMA hnsw_compact_index('idx')` to reclaim space.
 
-- Only vectors consisting of `FLOAT`s are supported at the moment.
-- The index itself is not buffer managed and must be able to fit into RAM memory. 
+## Persistence
 
-With that said, the index will be persisted into the database if you run DuckDB with a disk-backed database file. But there is no incremental updates, so every time DuckDB performs a checkpoint the entire index will be serialized to disk and overwrite its previous blocks. Similarly, the index will be deserialized back into main memory in its entirety after a restart of the database, although this will be deferred until you first access the table associated with the index. Depending on how large the index is, the deserialization process may take some time, but it should be faster than simply dropping and re-creating the index. 
+```sql
+SET hnsw_enable_experimental_persistence = true;
+```
 
----
+Indexes persist across restarts when using a disk-backed database. The full index is serialized on checkpoint and deserialized on first access.
 
-## Building the extension
+## Limitations
 
-### Build steps
-To build the extension, run:
+- Only `FLOAT` array types are supported.
+- The index must fit in RAM (not buffer-managed).
+- Subquery query vectors fall back to sequential scan — use literals or prepared statements.
+- RaBitQ with inner product metric has lower recall than L2sq or cosine (the L2sq graph proxy doesn't align well with IP ordering).
+
+## Building
+
 ```sh
-make
+make            # release build
+make debug      # debug build
+make test       # run all tests
 ```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/vss/vss.duckdb_extension
+
+Binaries:
+
 ```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `vss.duckdb_extension` is the loadable binary as it would be distributed.
-
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
-
-## Running the tests
-Thes SQL tests can be run using:
-```sh
-make test
+./build/release/duckdb                                    # shell with extension loaded
+./build/release/test/unittest                             # test runner
+./build/release/extension/hnsw_acorn/hnsw_acorn.duckdb_extension  # loadable extension
 ```
