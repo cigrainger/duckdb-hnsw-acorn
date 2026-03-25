@@ -74,6 +74,14 @@ PhysicalOperator &HNSWIndex::CreatePlan(PlanIndexInput &input) {
 			if (v.GetValue<int32_t>() < 2) {
 				throw BinderException("HNSW index 'M0' must be at least 2");
 			}
+		} else if (StringUtil::CIEquals(k, "quantization")) {
+			if (v.type() != LogicalType::VARCHAR) {
+				throw BinderException("HNSW index 'quantization' must be a string");
+			}
+			auto q = v.GetValue<string>();
+			if (!StringUtil::CIEquals(q, "rabitq") && !StringUtil::CIEquals(q, "none")) {
+				throw BinderException("HNSW index 'quantization' must be 'rabitq' or 'none'");
+			}
 		} else {
 			throw BinderException("Unknown option for HNSW index: '%s'", k);
 		}

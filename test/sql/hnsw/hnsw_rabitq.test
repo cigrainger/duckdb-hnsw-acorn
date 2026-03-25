@@ -1,0 +1,150 @@
+# name: test/sql/hnsw/hnsw_rabitq.test
+# description: Core RaBitQ binary quantization — happy path for all three metrics
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup: 500 rows with 3-dim vectors and a category column
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+# ==================================================================
+# L2 squared (default metric)
+# ==================================================================
+statement ok
+CREATE INDEX idx_l2 ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Optimizer picks up the HNSW index
+query II
+EXPLAIN SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns correct count
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# Results are ordered by distance (rescore guarantees exact ordering)
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM items
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# <-> operator also works
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY vec <-> [5.0, 6.0, 7.0]::FLOAT[3] LIMIT 5
+);
+----
+5
+
+# Different query vector — exercises different graph entry points
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    ORDER BY array_distance(vec, [9.0, 12.0, 16.0]::FLOAT[3])
+    LIMIT 15
+);
+----
+15
+
+statement ok
+DROP INDEX idx_l2;
+
+# ==================================================================
+# Cosine distance
+# ==================================================================
+statement ok
+CREATE INDEX idx_cos ON items USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
+
+# Optimizer uses the index with cosine
+query II
+EXPLAIN SELECT * FROM items ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns correct count
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items
+    ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# Results are ordered by cosine distance
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM items
+    ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# <=> operator
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY vec <=> [1.0, 2.0, 3.0]::FLOAT[3] LIMIT 5
+);
+----
+5
+
+statement ok
+DROP INDEX idx_cos;
+
+# ==================================================================
+# RaBitQ combined with other HNSW options
+# ==================================================================
+
+# RaBitQ + custom M and ef_construction
+statement ok
+CREATE INDEX idx_custom ON items USING HNSW (vec)
+    WITH (quantization = 'rabitq', M = 8, ef_construction = 50, ef_search = 50);
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+statement ok
+DROP INDEX idx_custom;
+
+# quantization = 'none' behaves identically to no quantization option
+statement ok
+CREATE INDEX idx_none ON items USING HNSW (vec) WITH (quantization = 'none');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+statement ok
+DROP INDEX idx_none;

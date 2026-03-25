@@ -1360,6 +1360,7 @@ class metric_punned_t {
     std::size_t dimensions_ = 0;
     metric_kind_t metric_kind_ = metric_kind_t::unknown_k;
     scalar_kind_t scalar_kind_ = scalar_kind_t::unknown_k;
+    std::size_t bytes_per_vector_override_ = 0;
 
 #if USEARCH_USE_SIMSIMD
     simsimd_capability_t isa_kind_ = simsimd_cap_serial_k;
@@ -1469,6 +1470,31 @@ class metric_punned_t {
         return metric;
     }
 
+    /**
+     *  @brief  Creates a metric with a custom bytes-per-vector layout (e.g., for quantized representations
+     *          where the stored size doesn't match dimensions * bits_per_scalar).
+     *
+     *  @param  dimensions          The number of logical dimensions in the original vectors.
+     *  @param  bytes_per_vector    The actual byte size of each stored (quantized) vector.
+     *  @param  metric_uintptr      The function pointer to the distance function (a, b, state) -> float.
+     *  @param  metric_state        An opaque state pointer passed as the third argument to the distance function.
+     *  @param  metric_kind         The kind of metric (for serialization metadata).
+     *  @return                     A metric object with the custom layout.
+     */
+    inline static metric_punned_t custom(std::size_t dimensions, std::size_t bytes_per_vector,
+                                         std::uintptr_t metric_uintptr, std::uintptr_t metric_state,
+                                         metric_kind_t metric_kind) noexcept {
+        metric_punned_t metric;
+        metric.metric_routed_ = &metric_punned_t::invoke_array_array_third;
+        metric.metric_ptr_ = metric_uintptr;
+        metric.metric_third_arg_ = metric_state;
+        metric.dimensions_ = dimensions;
+        metric.metric_kind_ = metric_kind;
+        metric.scalar_kind_ = scalar_kind_t::b1x8_k;
+        metric.bytes_per_vector_override_ = bytes_per_vector;
+        return metric;
+    }
+
     inline std::size_t dimensions() const noexcept { return dimensions_; }
     inline metric_kind_t metric_kind() const noexcept { return metric_kind_; }
     inline scalar_kind_t scalar_kind() const noexcept { return scalar_kind_; }
@@ -1503,6 +1529,8 @@ class metric_punned_t {
     }
 
     inline std::size_t bytes_per_vector() const noexcept {
+        if (bytes_per_vector_override_)
+            return bytes_per_vector_override_;
         return divide_round_up<CHAR_BIT>(dimensions_ * bits_per_scalar(scalar_kind_));
     }
 

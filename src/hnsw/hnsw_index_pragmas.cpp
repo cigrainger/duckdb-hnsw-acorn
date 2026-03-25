@@ -67,6 +67,15 @@ static unique_ptr<FunctionData> HNSWindexInfoBind(ClientContext &context, TableF
 	names.emplace_back("approx_memory_usage");
 	return_types.emplace_back(LogicalType::BIGINT);
 
+	names.emplace_back("quantization");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("bytes_per_vector");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	names.emplace_back("vector_memory_usage");
+	return_types.emplace_back(LogicalType::BIGINT);
+
 	names.emplace_back("levels");
 	return_types.emplace_back(LogicalType::BIGINT);
 
@@ -149,6 +158,13 @@ static void HNSWIndexInfoExecute(ClientContext &context, TableFunctionInput &dat
 		output.data[col++].SetValue(row, Value::BIGINT(stats->count));
 		output.data[col++].SetValue(row, Value::BIGINT(stats->capacity));
 		output.data[col++].SetValue(row, Value::BIGINT(stats->approx_size));
+
+		// Quantization info
+		auto bytes_per_vec = hnsw_index->index.metric().bytes_per_vector();
+		output.data[col++].SetValue(row, Value(hnsw_index->IsRaBitQ() ? "rabitq" : "none"));
+		output.data[col++].SetValue(row, Value::BIGINT(bytes_per_vec));
+		output.data[col++].SetValue(row, Value::BIGINT(bytes_per_vec * stats->count));
+
 		output.data[col++].SetValue(row, Value::BIGINT(stats->max_level));
 
 		vector<Value> level_stats;

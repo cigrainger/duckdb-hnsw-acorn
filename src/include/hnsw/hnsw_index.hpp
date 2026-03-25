@@ -14,9 +14,12 @@
 #include "duckdb/storage/index_storage_info.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "hnsw/rabitq.hpp"
 #include "usearch/index_dense.hpp"
 
 namespace duckdb {
+
+class DuckTableEntry;
 
 struct HNSWIndexStats {
 	idx_t max_level;
@@ -121,8 +124,25 @@ public:
 		index_size = index.size();
 	}
 
+	//! RaBitQ quantization support
+	bool IsRaBitQ() const {
+		return is_rabitq_;
+	}
+	const RaBitQState &GetRaBitQState() const {
+		return *rabitq_state_;
+	}
+	void SetRaBitQCentroid(vector<float> centroid);
+
+	//! Rescore RaBitQ candidates against original F32 vectors from table storage.
+	//! Called from the scan function after InitializeScan/InitializeFilteredScan.
+	static void RescoreRaBitQCandidates(IndexScanState &index_state, const HNSWIndex &hnsw_index,
+	                                    DuckTableEntry &table, idx_t limit, ClientContext &context);
+
 private:
 	bool is_dirty = false;
+	bool is_rabitq_ = false;
+	unique_ptr<RaBitQState> rabitq_state_;
+	unique_ptr<RaBitQDistanceContext> rabitq_distance_ctx_;
 	StorageLock rwlock;
 	atomic<idx_t> index_size = {0};
 	unique_ptr<ExpressionMatcher> function_matcher;

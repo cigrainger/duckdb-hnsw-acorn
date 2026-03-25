@@ -1,0 +1,228 @@
+# name: test/sql/hnsw/hnsw_rabitq_filtered.test
+# description: RaBitQ + ACORN-1 filtered search combinations
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category,
+    (i % 3) AS region
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# ==================================================================
+# Filtered search: all returned rows satisfy the predicate
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 3
+    ORDER BY array_distance(vec, [5.0, 6.0, 7.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 3;
+----
+0
+
+# Different filter column
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE region = 2
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.region != 2;
+----
+0
+
+# ==================================================================
+# Filtered search: results are ordered by distance
+# ==================================================================
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM items
+    WHERE category = 2
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# ==================================================================
+# High selectivity (>60%): standard HNSW path, not ACORN-1
+# category >= 0 matches 100% of rows
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category >= 0
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# ==================================================================
+# Medium selectivity: ACORN-1 path
+# category = 1 matches 20% of 500 = 100 rows
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# ==================================================================
+# Low selectivity: brute-force path
+# Specific ID matches 1 row (0.2% selectivity)
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE id = 42
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+);
+----
+1
+
+# ==================================================================
+# No matches — should return 0 rows
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 99
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+0
+
+# ==================================================================
+# Compound filter (AND)
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1 AND region = 0
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 5
+) sub WHERE sub.category != 1 OR sub.region != 0;
+----
+0
+
+# ==================================================================
+# Range filter
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE id BETWEEN 100 AND 200
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.id < 100 OR sub.id > 200;
+----
+0
+
+# ==================================================================
+# Filtered recall: RaBitQ + filter should return at least 8 of 10
+# correct results (3-dim vectors have coarse BBQ approximation)
+# ==================================================================
+# Get RaBitQ filtered results (index active, high oversample for best recall)
+statement ok
+SET hnsw_rabitq_oversample = 10;
+
+statement ok
+CREATE TABLE rabitq_filtered AS
+SELECT id FROM items WHERE category = 2
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+# Brute force for comparison (drop index, scan, recreate)
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE exact_filtered AS
+SELECT id FROM items WHERE category = 2
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+statement ok
+RESET hnsw_rabitq_oversample;
+
+# Perfect recall: all 10 match
+query I
+SELECT count(*) FROM exact_filtered WHERE id IN (SELECT id FROM rabitq_filtered);
+----
+10
+
+statement ok
+DROP TABLE exact_filtered;
+
+statement ok
+DROP TABLE rabitq_filtered;
+
+# ==================================================================
+# RaBitQ + filtered with cosine metric
+# ==================================================================
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE INDEX idx_cos ON items USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 4
+    ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 4;
+----
+0
+
+# Results are returned (cosine + filter + RaBitQ)
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 0
+    ORDER BY array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+);
+----
+20
+
+statement ok
+DROP INDEX idx_cos;
+
+# ==================================================================
+# Configurable ACORN threshold interacts with RaBitQ
+# ==================================================================
+statement ok
+CREATE INDEX idx_thresh ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Lower the acorn threshold so even 20% selectivity uses standard HNSW
+statement ok
+SET hnsw_acorn_threshold = 0.1;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+statement ok
+RESET hnsw_acorn_threshold;
+
+statement ok
+DROP INDEX idx_thresh;

@@ -1,0 +1,146 @@
+# name: test/sql/hnsw/hnsw_rabitq_persistence.test
+# description: RaBitQ index survives checkpoint/restart — centroid and quantized vectors persist
+# group: [hnsw]
+
+require hnsw_acorn
+
+load __TEST_DIR__/hnsw_rabitq_persist.db
+
+statement ok
+SET hnsw_enable_experimental_persistence = true;
+
+# ------------------------------------------------------------------
+# Setup: create table and RaBitQ index
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# Verify search works before checkpoint
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Verify filtered search works before checkpoint
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+# Capture pre-checkpoint results for comparison
+statement ok
+CREATE TABLE pre_checkpoint AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+# ------------------------------------------------------------------
+# Checkpoint and restart
+# ------------------------------------------------------------------
+statement ok
+CHECKPOINT;
+
+restart
+
+# ------------------------------------------------------------------
+# Verify after restart
+# ------------------------------------------------------------------
+
+# Index still exists and is used
+query II
+EXPLAIN SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Correct result count
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Results are ordered after restart
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM items
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# Filtered search works after restart
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items WHERE category = 1
+    ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+# Post-checkpoint results match pre-checkpoint results
+# (centroid deserialized correctly → same quantization → same rescore → same results)
+statement ok
+CREATE TABLE post_checkpoint AS
+SELECT id FROM items
+ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+query I
+SELECT count(*) FROM pre_checkpoint WHERE id IN (SELECT id FROM post_checkpoint);
+----
+10
+
+# ------------------------------------------------------------------
+# Insert after restart, then checkpoint again
+# ------------------------------------------------------------------
+statement ok
+INSERT INTO items
+SELECT i + 500 AS id,
+    array_value(((i + 500) % 10)::FLOAT, (((i + 500) * 7) % 13)::FLOAT, (((i + 500) * 3) % 17)::FLOAT) AS vec,
+    ((i + 500) % 5) AS category
+FROM range(100) t(i);
+
+# Search works with new data
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Checkpoint with new data
+statement ok
+CHECKPOINT;
+
+restart
+
+# Verify after second restart
+query I
+SELECT count(*) FROM (
+    SELECT * FROM items ORDER BY array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 10
+);
+----
+10
+
+# Table has the expanded row count
+query I
+SELECT count(*) FROM items;
+----
+600
