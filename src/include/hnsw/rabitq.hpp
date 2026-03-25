@@ -41,13 +41,11 @@ vector<float> RaBitQComputeCentroid(ColumnDataCollection &collection, idx_t dime
 //! before computing the residual (used for cosine metric).
 void RaBitQQuantizeVector(const float *input, const RaBitQState &state, uint8_t *output, bool normalize_input = false);
 
-//! RaBitQ distance function for L2 squared metric.
-//! Signature matches usearch's metric_array_array_state_t: (uptr_t a, uptr_t b, uptr_t state) -> float
+//! RaBitQ approximate distance function (L2 squared estimator).
+//! Used for all metrics during HNSW graph construction/traversal. For cosine,
+//! vectors are pre-normalized so L2sq preserves cosine ordering.
+//! Signature: (uptr_t a, uptr_t b, uptr_t state) -> float
 float RaBitQDistanceL2sq(std::size_t a_ptr, std::size_t b_ptr, std::size_t ctx_ptr);
-
-//! RaBitQ distance function for cosine metric.
-//! For pre-normalized vectors, cosine_distance(a,b) = l2sq(a,b) / 2
-float RaBitQDistanceCosine(std::size_t a_ptr, std::size_t b_ptr, std::size_t ctx_ptr);
 
 //! Compute exact L2 squared distance between two F32 vectors
 float ExactDistanceL2sq(const float *a, const float *b, idx_t dimensions);

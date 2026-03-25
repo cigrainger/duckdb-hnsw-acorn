@@ -127,10 +127,9 @@ void RaBitQQuantizeVector(const float *input, const RaBitQState &state, uint8_t 
 	auto dimensions = state.dimensions;
 	auto binary_bytes = (dimensions + 7) / 8;
 
-	// Temporary buffer for the residual (stack-allocate for reasonable dimensions)
-	// For very large dimensions this could be heap-allocated, but patent embeddings
-	// are typically 768-1024 dims (3-4KB on stack)
-	auto residual = reinterpret_cast<float *>(alloca(dimensions * sizeof(float)));
+	// Heap-allocate residual buffer — safe for any dimension count.
+	auto residual_buf = make_uniq_array<float>(dimensions);
+	auto residual = residual_buf.get();
 
 	// Step 1: Optionally normalize input (for cosine metric)
 	if (normalize_input) {
@@ -217,65 +216,16 @@ float RaBitQDistanceL2sq(std::size_t a_ptr, std::size_t b_ptr, std::size_t ctx_p
 	// <b_a, b_b> = D - 2*hamming
 	float binary_dot = static_cast<float>(D) - 2.0f * static_cast<float>(hamming);
 
-	// Approximate <unit_a, unit_b> using correction factors:
-	// <u_a, u_b> ≈ vdot_a * vdot_b * binary_dot / D
-	// (vdot already includes the 1/sqrt(D) normalization, so the product
-	//  gives us the scaled estimate directly when divided by D... but wait,
-	//  let me be precise about the math.)
-	//
-	// binary_dot = <sign_a, sign_b> where entries are ±1
-	// The "reconstructed" binary vectors in RaBitQ are ±1/sqrt(D), so
-	//   <recon_a, recon_b> = binary_dot / D
-	// And vdot_a = <u_a, recon_a>, vdot_b = <u_b, recon_b>
-	// The estimator: <u_a, u_b> ≈ (vdot_a * vdot_b) * (binary_dot / D)
-	//   ... but this double-counts. The correct RaBitQ estimator for
-	//   inner product between two quantized vectors is simpler:
-	//
-	// <u_a, u_b> ≈ vdot_a * vdot_b * binary_dot / D
-	// This works because each vdot captures the correlation between
-	// the unit vector and its binary representative.
+	// RaBitQ inner product estimator for unit vectors u_a, u_b:
+	//   binary_dot = <sign_a, sign_b> in {-1,+1}^D = D - 2*hamming
+	//   Reconstructed binary vectors are ±1/sqrt(D), so <recon_a, recon_b> = binary_dot / D
+	//   vdot_i = <u_i, recon_i> captures correlation between unit vector and its binary rep.
+	//   Estimator: <u_a, u_b> ≈ vdot_a * vdot_b * binary_dot / D
 	float unit_dot_approx = vdot_a * vdot_b * binary_dot / static_cast<float>(D);
 
 	// ||v_a - v_b||^2 = ||r_a - r_b||^2  (centroid cancels)
 	//                  = norm_a^2 + norm_b^2 - 2 * norm_a * norm_b * <u_a, u_b>
 	return norm_a * norm_a + norm_b * norm_b - 2.0f * norm_a * norm_b * unit_dot_approx;
-}
-
-float RaBitQDistanceCosine(std::size_t a_ptr, std::size_t b_ptr, std::size_t ctx_ptr) {
-	auto &ctx = *reinterpret_cast<const RaBitQDistanceContext *>(ctx_ptr);
-	auto a = reinterpret_cast<const uint8_t *>(a_ptr);
-	auto b = reinterpret_cast<const uint8_t *>(b_ptr);
-	auto bb = ctx.binary_bytes;
-	auto D = ctx.dimensions;
-
-	float norm_a, vdot_a, norm_b, vdot_b;
-	std::memcpy(&norm_a, a + bb, sizeof(float));
-	std::memcpy(&vdot_a, a + bb + sizeof(float), sizeof(float));
-	std::memcpy(&norm_b, b + bb, sizeof(float));
-	std::memcpy(&vdot_b, b + bb + sizeof(float), sizeof(float));
-
-	auto hamming = HammingDistance(a, b, bb);
-	float binary_dot = static_cast<float>(D) - 2.0f * static_cast<float>(hamming);
-	float unit_dot_approx = vdot_a * vdot_b * binary_dot / static_cast<float>(D);
-
-	// cosine_distance = 1 - <v_a, v_b> / (||v_a|| * ||v_b||)
-	// <v_a, v_b> = <r_a + c, r_b + c> but we quantize r = v - c, so:
-	// <v_a, v_b> ≈ norm_a * norm_b * unit_dot_approx + centroid terms
-	// However, we don't store centroid dot products per vector.
-	//
-	// Simpler: cosine_distance(a,b) = 1 - cos(a,b)
-	// For vectors from centroid: cos(a,b) ≈ <r_a, r_b> / (||r_a|| * ||r_b||) when centroid ≈ 0
-	// which equals unit_dot_approx.
-	// This is approximate but preserves ordering for the HNSW graph.
-	float cos_sim = unit_dot_approx;
-	// Clamp to [-1, 1] to avoid negative distances from approximation errors
-	if (cos_sim > 1.0f) {
-		cos_sim = 1.0f;
-	}
-	if (cos_sim < -1.0f) {
-		cos_sim = -1.0f;
-	}
-	return 1.0f - cos_sim;
 }
 
 //------------------------------------------------------------------------------

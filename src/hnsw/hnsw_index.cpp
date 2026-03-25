@@ -1,6 +1,7 @@
 #include "hnsw/hnsw_index.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/assert.hpp"
@@ -269,61 +270,68 @@ HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_ty
 		if (!info.allocator_infos[0].buffer_ids.empty()) {
 			LinkedBlockReader reader(*linked_block_allocator, root_block_ptr);
 
-			// Detect RaBitQ stream: RaBitQ indexes start with magic byte 'R' (0x52).
-			// Legacy usearch streams start with uint32 matrix_rows (little-endian),
-			// whose low byte is the row count mod 256 — never 'R' (0x52 = 82) for
-			// any practical index.
-			uint8_t first_byte = 0;
-			reader.ReadData(reinterpret_cast<data_ptr_t>(&first_byte), sizeof(first_byte));
+			// Detect RaBitQ stream via 8-byte magic "RABITQ01". This is safe because
+			// legacy usearch streams start with [uint32 rows][uint32 cols], and the magic
+			// would require rows=0x49424152 (1.2B) AND cols=0x31305154 (825M) simultaneously.
+			static constexpr char RABITQ_MAGIC[8] = {'R', 'A', 'B', 'I', 'T', 'Q', '0', '1'};
+			char header[8] = {};
+			reader.ReadData(reinterpret_cast<data_ptr_t>(header), sizeof(header));
 
-			bool stream_is_rabitq = (first_byte == 'R');
+			bool stream_is_rabitq = (std::memcmp(header, RABITQ_MAGIC, sizeof(RABITQ_MAGIC)) == 0);
+
+			if (stream_is_rabitq && !is_rabitq_) {
+				// Options didn't survive restart — reconstruct RaBitQ state
+				is_rabitq_ = true;
+				rabitq_distance_ctx_ = make_uniq<RaBitQDistanceContext>();
+				rabitq_distance_ctx_->dimensions = vector_size;
+				rabitq_distance_ctx_->binary_bytes = (vector_size + 7) / 8;
+
+				auto distance_fn = reinterpret_cast<std::uintptr_t>(&RaBitQDistanceL2sq);
+				auto rabitq_metric = unum::usearch::metric_punned_t::custom(
+				    vector_size, RaBitQBytesPerVector(vector_size), distance_fn,
+				    reinterpret_cast<std::uintptr_t>(rabitq_distance_ctx_.get()), metric_kind);
+
+				rabitq_state_ = make_uniq<RaBitQState>();
+				rabitq_state_->dimensions = vector_size;
+				rabitq_state_->original_metric = metric_kind;
+
+				index = unum::usearch::index_dense_gt<row_t>::make(rabitq_metric, config);
+			}
 
 			if (stream_is_rabitq) {
-				// Initialize RaBitQ state (options may not survive restart)
-				if (!is_rabitq_) {
-					is_rabitq_ = true;
-					rabitq_distance_ctx_ = make_uniq<RaBitQDistanceContext>();
-					rabitq_distance_ctx_->dimensions = vector_size;
-					rabitq_distance_ctx_->binary_bytes = (vector_size + 7) / 8;
-
-					auto distance_fn = reinterpret_cast<std::uintptr_t>(&RaBitQDistanceL2sq);
-
-					auto rabitq_metric = unum::usearch::metric_punned_t::custom(
-					    vector_size, RaBitQBytesPerVector(vector_size), distance_fn,
-					    reinterpret_cast<std::uintptr_t>(rabitq_distance_ctx_.get()), metric_kind);
-
-					rabitq_state_ = make_uniq<RaBitQState>();
-					rabitq_state_->dimensions = vector_size;
-					rabitq_state_->original_metric = metric_kind;
-
-					// Rebuild the index with the RaBitQ metric
-					index = unum::usearch::index_dense_gt<row_t>::make(rabitq_metric, config);
-				}
-
 				uint64_t centroid_dims = 0;
 				reader.ReadData(reinterpret_cast<data_ptr_t>(&centroid_dims), sizeof(centroid_dims));
+				if (centroid_dims != vector_size) {
+					throw InternalException("RaBitQ centroid dimensions mismatch: expected %llu, got %llu",
+					                        vector_size, centroid_dims);
+				}
 				rabitq_state_->centroid.resize(centroid_dims);
 				reader.ReadData(reinterpret_cast<data_ptr_t>(rabitq_state_->centroid.data()),
 				                centroid_dims * sizeof(float));
 			}
 
-			// Load the usearch index stream.
-			// For legacy (non-RaBitQ) format, we consumed the first byte which is
-			// part of the usearch stream — inject it back on the first read call.
-			bool inject_first_byte = !stream_is_rabitq;
+			// Load usearch stream. For legacy format, inject the consumed 8 header bytes back.
+			bool inject_header = !stream_is_rabitq;
+			idx_t header_offset = 0;
 			USearchIndexType::serialization_config_t sconfig;
 			sconfig.preserve_metric = is_rabitq_;
 
 			index.load_from_stream(
 			    [&](void *data, size_t size) -> bool {
-				    if (inject_first_byte) {
-					    inject_first_byte = false;
+				    if (inject_header) {
 					    auto ptr = static_cast<data_ptr_t>(data);
-					    ptr[0] = first_byte;
-					    if (size == 1) {
+					    idx_t to_inject = MinValue(static_cast<idx_t>(sizeof(header)) - header_offset,
+					                               static_cast<idx_t>(size));
+					    std::memcpy(ptr, header + header_offset, to_inject);
+					    header_offset += to_inject;
+					    if (header_offset >= sizeof(header)) {
+						    inject_header = false;
+					    }
+					    if (to_inject == size) {
 						    return true;
 					    }
-					    return (reader.ReadData(ptr + 1, size - 1) + 1) == size;
+					    auto remaining = size - to_inject;
+					    return remaining == reader.ReadData(ptr + to_inject, remaining);
 				    }
 				    return size == reader.ReadData(static_cast<data_ptr_t>(data), size);
 			    },
@@ -689,6 +697,10 @@ void HNSWIndex::ResetMultiScan(IndexScanState &state) {
 void HNSWIndex::SetRaBitQCentroid(vector<float> centroid) {
 	D_ASSERT(is_rabitq_);
 	D_ASSERT(rabitq_state_);
+	// The centroid is computed once during bulk index construction and never updated.
+	// Vectors inserted later are quantized against this centroid. As data distribution
+	// shifts, graph traversal quality may degrade, but the rescore phase mitigates
+	// this for final results. A full index rebuild recomputes the centroid.
 	rabitq_state_->centroid = std::move(centroid);
 }
 
@@ -825,22 +837,26 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 	{
 		// Now we can be sure that we have enough space in the index
 		auto lock = rwlock.GetSharedLock();
+
+		// Pre-allocate quantization buffer outside the loop (reused per vector)
+		unique_array<uint8_t> rabitq_buf;
+		bool rabitq_normalize = false;
+		if (is_rabitq_ && rabitq_state_) {
+			rabitq_buf = make_uniq_array<uint8_t>(RaBitQBytesPerVector(rabitq_state_->dimensions));
+			rabitq_normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
+		}
+
 		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
 			if (FlatVector::IsNull(vec_vec, out_idx)) {
-				// Dont add nulls
 				continue;
 			}
 
 			auto rowid = rowid_data[out_idx];
 			USearchIndexType::add_result_t result;
-			if (is_rabitq_ && rabitq_state_) {
-				// Quantize before inserting
-				auto bbq_size = RaBitQBytesPerVector(rabitq_state_->dimensions);
-				auto bbq_buf = make_uniq_array<uint8_t>(bbq_size);
-				bool normalize = rabitq_state_->original_metric == unum::usearch::metric_kind_t::cos_k;
-				RaBitQQuantizeVector(vec_child_data + (out_idx * array_size), *rabitq_state_, bbq_buf.get(),
-				                     normalize);
-				result = index.add(rowid, reinterpret_cast<const unum::usearch::b1x8_t *>(bbq_buf.get()),
+			if (rabitq_buf) {
+				RaBitQQuantizeVector(vec_child_data + (out_idx * array_size), *rabitq_state_, rabitq_buf.get(),
+				                     rabitq_normalize);
+				result = index.add(rowid, reinterpret_cast<const unum::usearch::b1x8_t *>(rabitq_buf.get()),
 				                   thread_idx);
 			} else {
 				result = index.add(rowid, vec_child_data + (out_idx * array_size), thread_idx);
@@ -920,15 +936,10 @@ void HNSWIndex::PersistToDisk() {
 	LinkedBlockWriter writer(*linked_block_allocator, root_block_ptr);
 	writer.Reset();
 
-	// For RaBitQ indexes, write a header with magic + centroid before usearch stream.
-	// Legacy (non-RaBitQ) indexes write usearch stream directly — no header.
-	// On load, we detect RaBitQ by checking if the first byte is 'R' (0x52),
-	// which cannot be the first byte of a legacy usearch stream (which starts
-	// with uint32 matrix_rows — the low byte of a row count is never 'R' for
-	// any practical index size).
+	// For RaBitQ indexes, write 8-byte magic + centroid before the usearch stream.
 	if (is_rabitq_ && rabitq_state_) {
-		uint8_t magic = 'R'; // 0x52 — identifies RaBitQ stream
-		writer.WriteData(reinterpret_cast<const_data_ptr_t>(&magic), sizeof(magic));
+		static constexpr char RABITQ_MAGIC[8] = {'R', 'A', 'B', 'I', 'T', 'Q', '0', '1'};
+		writer.WriteData(reinterpret_cast<const_data_ptr_t>(RABITQ_MAGIC), sizeof(RABITQ_MAGIC));
 
 		uint64_t centroid_dims = rabitq_state_->dimensions;
 		writer.WriteData(reinterpret_cast<const_data_ptr_t>(&centroid_dims), sizeof(centroid_dims));
