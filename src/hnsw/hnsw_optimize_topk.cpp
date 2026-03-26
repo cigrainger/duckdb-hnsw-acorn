@@ -208,11 +208,6 @@ public:
 			if (k_limit <= 0 || k_limit >= STANDARD_VECTOR_SIZE) {
 				continue;
 			}
-			// For grouped aggregation, oversample to ensure each group gets enough results.
-			// Multiply k by 10 as a conservative estimate (capped at table size).
-			if (!agg.groups.empty()) {
-				k_limit = MinValue<int32_t>(k_limit * 10, STANDARD_VECTOR_SIZE - 1);
-			}
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, k_limit, std::move(query_vector));
 			break;
 		}
@@ -225,6 +220,34 @@ public:
 		// Push table filters into the bind data for filtered HNSW search
 		ExtractFiltersIntoBind(duck_table, get, *bind_data);
 
+		// For grouped aggregation, set the group column for per-group ACORN-1 search.
+		// The group expression must be a simple column ref on the same table.
+		if (!agg.groups.empty()) {
+			if (agg.groups.size() != 1 || agg.groups[0]->type != ExpressionType::BOUND_COLUMN_REF) {
+				return false;
+			}
+			auto &group_ref = agg.groups[0]->Cast<BoundColumnRefExpression>();
+			// Resolve through compression projection if present
+			idx_t group_col_idx = group_ref.binding.column_index;
+			if (agg.children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &proj = agg.children[0]->Cast<LogicalProjection>();
+				if (group_ref.binding.table_index == proj.table_index &&
+				    group_col_idx < proj.expressions.size()) {
+					auto &proj_expr = proj.expressions[group_col_idx];
+					if (proj_expr->type == ExpressionType::BOUND_COLUMN_REF) {
+						group_col_idx = proj_expr->Cast<BoundColumnRefExpression>().binding.column_index;
+					}
+				}
+			}
+			// Map through GET's column_ids to table column index
+			auto get_col_ids = get.GetColumnIds();
+			if (group_col_idx < get_col_ids.size()) {
+				bind_data->group_column = get_col_ids[group_col_idx].GetPrimaryIndex();
+			} else {
+				return false;
+			}
+		}
+
 		// Replace the aggregate with a index scan + projection
 		get.function = HNSWIndexScanFunction::GetFunction();
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
@@ -233,12 +256,12 @@ public:
 		get.bind_data = std::move(bind_data);
 
 		// For ungrouped: replace min_by with LIST (index scan returns exactly K results)
-		// For grouped: keep min_by as-is (it handles per-group K internally)
+		// For grouped: keep min_by (per-group ACORN-1 search handles the filtering,
+		//              min_by selects top-K per group from the per-group results)
 		if (agg.groups.empty()) {
 			agg.expressions[0] = CreateListOrderByExpr(context, col_expr->Copy(), dist_expr->Copy(),
 			                                           agg_func_expr.filter ? agg_func_expr.filter->Copy() : nullptr);
 		}
-		// For grouped case, min_by stays — it picks top-K per group from the oversized scan results.
 
 		return true;
 	}

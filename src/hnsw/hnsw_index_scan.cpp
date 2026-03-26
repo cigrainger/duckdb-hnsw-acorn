@@ -87,7 +87,96 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	// Initialize the scan state for the index
 	auto &hnsw_index = bind_data.index.Cast<HNSWIndex>();
 
-	if (bind_data.HasMetadataJoin()) {
+	if (bind_data.HasGroupedSearch()) {
+		// Per-group ACORN-1: scan distinct group values, build a bitset per group,
+		// run filtered HNSW search per group, collect all results.
+		auto &data_table = bind_data.table.GetStorage();
+		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+		auto &duck_table_entry = bind_data.table.Cast<DuckTableEntry>();
+
+		auto group_col_storage_id = duck_table_entry.GetColumn(
+		    LogicalIndex(bind_data.group_column)).StorageOid();
+
+		// Scan the group column + ROW_ID to build per-group bitsets
+		vector<StorageIndex> group_scan_col_ids = {StorageIndex(group_col_storage_id)};
+		vector<LogicalType> group_scan_types = {
+		    duck_table_entry.GetColumn(LogicalIndex(bind_data.group_column)).GetType()};
+		group_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+		group_scan_types.push_back(LogicalType::ROW_TYPE);
+
+		TableScanState group_scan_state;
+		group_scan_state.Initialize(group_scan_col_ids);
+		data_table.InitializeScan(context, transaction, group_scan_state, group_scan_col_ids);
+
+		auto total_rows = data_table.GetTotalRows();
+
+		// Build per-group row_id sets (group_value → list of row_ids)
+		unordered_map<int64_t, vector<idx_t>> group_row_ids;
+		DataChunk group_chunk;
+		group_chunk.Initialize(context, group_scan_types);
+		while (true) {
+			group_chunk.Reset();
+			data_table.Scan(transaction, group_chunk, group_scan_state);
+			if (group_chunk.size() == 0) {
+				break;
+			}
+			group_chunk.Flatten();
+			auto group_data = FlatVector::GetData<int64_t>(group_chunk.data[0]);
+			auto rid_data = FlatVector::GetData<row_t>(group_chunk.data[1]);
+			for (idx_t i = 0; i < group_chunk.size(); i++) {
+				group_row_ids[group_data[i]].push_back(static_cast<idx_t>(rid_data[i]));
+			}
+		}
+
+		// Run per-group filtered search and collect all row_ids
+		vector<row_t> all_result_row_ids;
+		for (auto &[group_val, row_ids] : group_row_ids) {
+			// Build bitset for this group
+			vector<uint64_t> group_bitset((total_rows / 64) + 1, 0);
+			for (auto rid : row_ids) {
+				auto word = rid / 64;
+				if (word >= group_bitset.size()) {
+					group_bitset.resize(word + 1, 0);
+				}
+				group_bitset[word] |= (1ULL << (rid % 64));
+			}
+
+			// Run ACORN-1 filtered search for this group
+			auto group_state = hnsw_index.InitializeFilteredScan(
+			    bind_data.query.get(), bind_data.limit, std::move(group_bitset), context);
+
+			// Collect results
+			Vector group_result_ids(LogicalType::ROW_TYPE);
+			auto count = hnsw_index.Scan(*group_state, group_result_ids);
+			if (count > 0) {
+				auto ids = FlatVector::GetData<row_t>(group_result_ids);
+				for (idx_t i = 0; i < count; i++) {
+					all_result_row_ids.push_back(ids[i]);
+				}
+			}
+		}
+
+		// Create a scan state that returns these pre-computed row_ids
+		// We use InitializeScan with the full result set — the min_by aggregate
+		// above will handle per-group selection.
+		if (!all_result_row_ids.empty()) {
+			// Build a bitset from all per-group results
+			vector<uint64_t> combined_bitset((total_rows / 64) + 1, 0);
+			for (auto rid : all_result_row_ids) {
+				auto word = static_cast<idx_t>(rid) / 64;
+				if (word >= combined_bitset.size()) {
+					combined_bitset.resize(word + 1, 0);
+				}
+				combined_bitset[word] |= (1ULL << (static_cast<idx_t>(rid) % 64));
+			}
+			// Use a large limit to return all per-group results
+			auto total_limit = all_result_row_ids.size();
+			result->index_state = hnsw_index.InitializeFilteredScan(
+			    bind_data.query.get(), total_limit, std::move(combined_bitset), context);
+		} else {
+			result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), 0, context);
+		}
+	} else if (bind_data.HasMetadataJoin()) {
 		// Metadata join: scan the metadata table with its filters to get matching
 		// join keys, then look up which row_ids in the indexed table have those
 		// keys, and build a filter bitset for ACORN-1 filtered search.
@@ -159,6 +248,45 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					}
 					filter_bitset[word] |= (1ULL << (rid % 64));
 				}
+			}
+		}
+
+		// If the indexed table also has base-table filters (e.g., e.id > 100),
+		// intersect them with the metadata-derived bitset.
+		if (bind_data.HasFilters()) {
+			auto filter_scan_col_ids = bind_data.filter_scan_column_ids;
+			auto filter_scan_types = bind_data.filter_scan_types;
+			filter_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+			filter_scan_types.push_back(LogicalType::ROW_TYPE);
+
+			TableScanState base_filter_state;
+			base_filter_state.Initialize(filter_scan_col_ids);
+			data_table.InitializeScan(context, transaction, base_filter_state, filter_scan_col_ids,
+			                          &bind_data.table_filters);
+
+			// Build a base-table filter bitset and intersect with the metadata bitset
+			vector<uint64_t> base_bitset(filter_bitset.size(), 0);
+			DataChunk base_chunk;
+			base_chunk.Initialize(context, filter_scan_types);
+			auto base_rid_col = filter_scan_types.size() - 1;
+			while (true) {
+				base_chunk.Reset();
+				data_table.Scan(transaction, base_chunk, base_filter_state);
+				if (base_chunk.size() == 0) {
+					break;
+				}
+				auto rid_data = FlatVector::GetData<row_t>(base_chunk.data[base_rid_col]);
+				for (idx_t i = 0; i < base_chunk.size(); i++) {
+					auto rid = static_cast<idx_t>(rid_data[i]);
+					auto word = rid / 64;
+					if (word < base_bitset.size()) {
+						base_bitset[word] |= (1ULL << (rid % 64));
+					}
+				}
+			}
+			// Intersect: keep only rows that pass BOTH metadata join AND base-table filters
+			for (idx_t w = 0; w < filter_bitset.size(); w++) {
+				filter_bitset[w] &= (w < base_bitset.size()) ? base_bitset[w] : 0;
 			}
 		}
 

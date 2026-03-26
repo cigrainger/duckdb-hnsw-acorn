@@ -236,6 +236,13 @@ public:
 			if (!meta_table.IsDuckTable()) {
 				return false;
 			}
+
+			// Join key must be BIGINT (we read it as int64_t during scan init)
+			auto idx_join_col_type = duck_table.GetColumn(LogicalIndex(indexed_join_col)).GetType();
+			if (idx_join_col_type.id() != LogicalTypeId::BIGINT) {
+				return false;
+			}
+
 			bind_data->metadata_table = &meta_table;
 			bind_data->indexed_join_column = indexed_join_col;
 			bind_data->metadata_join_column = metadata_join_col;
@@ -272,10 +279,10 @@ public:
 		get.bind_data = std::move(bind_data);
 
 		if (comparison_join) {
-			// Metadata join: keep the JOIN but remove the TOP_N.
-			// The HNSW_INDEX_SCAN (with metadata-derived bitset) handles the limit.
-			// The JOIN re-attaches metadata columns to the HNSW results.
-			plan = std::move(top_n.children[0]);
+			// Metadata join: keep the TOP_N above the JOIN to enforce LIMIT
+			// after the JOIN re-attaches metadata columns. The HNSW_INDEX_SCAN
+			// uses ACORN-1 with the metadata-derived bitset for filtered search,
+			// but the JOIN can duplicate rows (non-1:1 keys), so TOP_N must stay.
 			return true;
 		}
 

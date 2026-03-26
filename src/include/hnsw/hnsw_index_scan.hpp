@@ -69,6 +69,16 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 		return metadata_table.get() != nullptr;
 	}
 
+	//! --- Grouped TopK fields (optional) ---
+	//! When set, the scan runs per-group ACORN-1 filtered search.
+	//! For each distinct value of the group column, builds a filter bitset
+	//! and runs a separate HNSW filtered search.
+	idx_t group_column = DConstants::INVALID_INDEX;
+
+	bool HasGroupedSearch() const {
+		return group_column != DConstants::INVALID_INDEX;
+	}
+
 public:
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<HNSWIndexScanBindData>();
