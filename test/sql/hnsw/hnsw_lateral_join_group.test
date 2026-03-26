@@ -52,8 +52,10 @@ statement ok
 CREATE INDEX items_embedding_idx ON items USING hnsw(embedding);
 
 # With the index, the lateral join uses HNSW_INDEX_JOIN (approximate search).
-# Results may differ from brute force, so verify correct count and structure
+# Results may differ from brute force, so verify count, structure, and validity
 # instead of exact value matching.
+
+# Correct count: 2 queries × 3 results = 6 rows
 query I
 SELECT count(*) FROM (
 	SELECT queries.id as id, nbr
@@ -67,6 +69,35 @@ SELECT count(*) FROM (
 ----
 6
 
+# All nbr values exist in items table
+query I
+SELECT count(*) FROM (
+	SELECT queries.id as id, nbr
+	FROM queries, LATERAL (
+		SELECT items.id as nbr, array_distance(items.embedding, queries.embedding) as dist
+		FROM items
+		ORDER BY dist
+		LIMIT 3
+	)
+) sub WHERE sub.nbr NOT IN (SELECT id FROM items);
+----
+0
+
+# All id values exist in queries table
+query I
+SELECT count(*) FROM (
+	SELECT queries.id as id, nbr
+	FROM queries, LATERAL (
+		SELECT items.id as nbr, array_distance(items.embedding, queries.embedding) as dist
+		FROM items
+		ORDER BY dist
+		LIMIT 3
+	)
+) sub WHERE sub.id NOT IN (SELECT id FROM queries);
+----
+0
+
+# GROUP BY produces one row per query
 query I
 SELECT count(*) FROM (
 	SELECT queries.id as id, list(nbr ORDER BY dist, nbr)
