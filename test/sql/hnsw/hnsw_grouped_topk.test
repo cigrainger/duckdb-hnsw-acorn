@@ -1,0 +1,168 @@
+# name: test/sql/hnsw/hnsw_grouped_topk.test
+# description: Test grouped min_by optimization with HNSW index
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+# ==================================================================
+# 1. Ungrouped min_by (baseline — already worked)
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) FROM items;
+----
+5
+
+# ==================================================================
+# 2. Grouped min_by uses HNSW index
+# ==================================================================
+query II
+EXPLAIN SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM items GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# ==================================================================
+# 3. Grouped min_by results match brute force
+# ==================================================================
+statement ok
+CREATE TABLE idx_grouped AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_grouped AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+# All groups present
+query I
+SELECT count(*) FROM idx_grouped;
+----
+5
+
+query I
+SELECT count(*) FROM bf_grouped;
+----
+5
+
+# Results match
+query I
+SELECT count(*) FROM idx_grouped ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_grouped bg
+    WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+5
+
+statement ok
+DROP TABLE idx_grouped;
+
+statement ok
+DROP TABLE bf_grouped;
+
+# ==================================================================
+# 4. Grouped min_by with different k values
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+# k=1 (single closest per group)
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) AS closest
+    FROM items GROUP BY category
+);
+----
+5
+
+# k=5
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM items GROUP BY category
+);
+----
+5
+
+# ==================================================================
+# 5. Each group's results are valid (exist in the table with correct category)
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items WHERE items.id = sub.closest_id AND items.category = sub.category
+);
+----
+0
+
+# ==================================================================
+# 6. Grouped min_by with cosine metric
+# ==================================================================
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE INDEX idx_cos ON items USING HNSW (vec) WITH (metric = 'cosine');
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items GROUP BY category
+);
+----
+5
+
+statement ok
+DROP INDEX idx_cos;
+
+# ==================================================================
+# 7. Grouped min_by with RaBitQ
+# ==================================================================
+statement ok
+CREATE INDEX idx_rq ON items USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items GROUP BY category
+);
+----
+5
+
+statement ok
+DROP INDEX idx_rq;
+
+# ==================================================================
+# 8. Grouped min_by with WHERE filter
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items
+    WHERE category IN (1, 3)
+    GROUP BY category
+);
+----
+2

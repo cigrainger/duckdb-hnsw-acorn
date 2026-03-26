@@ -1,5 +1,7 @@
 #include "hnsw/hnsw_index_scan.hpp"
 
+#include <unordered_set>
+
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -85,7 +87,84 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	// Initialize the scan state for the index
 	auto &hnsw_index = bind_data.index.Cast<HNSWIndex>();
 
-	if (bind_data.HasFilters()) {
+	if (bind_data.HasMetadataJoin()) {
+		// Metadata join: scan the metadata table with its filters to get matching
+		// join keys, then look up which row_ids in the indexed table have those
+		// keys, and build a filter bitset for ACORN-1 filtered search.
+		auto &data_table = bind_data.table.GetStorage();
+		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+		auto &meta_table_entry = const_cast<DuckTableEntry &>(bind_data.metadata_table->Cast<DuckTableEntry>());
+		auto &meta_data_table = meta_table_entry.GetStorage();
+
+		// Step 1: Scan metadata table with filters → collect matching join key values
+		auto meta_scan_col_ids = bind_data.metadata_scan_column_ids;
+		auto meta_scan_types = bind_data.metadata_scan_types;
+
+		TableScanState meta_scan_state;
+		meta_scan_state.Initialize(meta_scan_col_ids);
+		meta_data_table.InitializeScan(context, transaction, meta_scan_state, meta_scan_col_ids,
+		                               &bind_data.metadata_filters);
+
+		unordered_set<int64_t> matching_keys;
+		DataChunk meta_chunk;
+		meta_chunk.Initialize(context, meta_scan_types);
+		while (true) {
+			meta_chunk.Reset();
+			meta_data_table.Scan(transaction, meta_chunk, meta_scan_state);
+			if (meta_chunk.size() == 0) {
+				break;
+			}
+			meta_chunk.Flatten();
+			// Join key is at position 0 in our scan columns
+			auto key_data = FlatVector::GetData<int64_t>(meta_chunk.data[0]);
+			for (idx_t i = 0; i < meta_chunk.size(); i++) {
+				matching_keys.insert(key_data[i]);
+			}
+		}
+
+		// Step 2: Scan the indexed table's join column + ROW_ID to find matching row_ids
+		auto &idx_duck_table = bind_data.table.Cast<DuckTableEntry>();
+		auto join_col_storage_id = idx_duck_table.GetColumn(
+		    LogicalIndex(bind_data.indexed_join_column)).StorageOid();
+		vector<StorageIndex> idx_scan_col_ids = {StorageIndex(join_col_storage_id)};
+		vector<LogicalType> idx_scan_types = {
+		    idx_duck_table.GetColumn(LogicalIndex(bind_data.indexed_join_column)).GetType()};
+		idx_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+		idx_scan_types.push_back(LogicalType::ROW_TYPE);
+
+		TableScanState idx_scan_state;
+		idx_scan_state.Initialize(idx_scan_col_ids);
+		data_table.InitializeScan(context, transaction, idx_scan_state, idx_scan_col_ids);
+
+		auto total_rows = data_table.GetTotalRows();
+		vector<uint64_t> filter_bitset((total_rows / 64) + 1, 0);
+
+		DataChunk idx_chunk;
+		idx_chunk.Initialize(context, idx_scan_types);
+		while (true) {
+			idx_chunk.Reset();
+			data_table.Scan(transaction, idx_chunk, idx_scan_state);
+			if (idx_chunk.size() == 0) {
+				break;
+			}
+			idx_chunk.Flatten();
+			auto key_data = FlatVector::GetData<int64_t>(idx_chunk.data[0]);
+			auto rid_data = FlatVector::GetData<row_t>(idx_chunk.data[1]);
+			for (idx_t i = 0; i < idx_chunk.size(); i++) {
+				if (matching_keys.count(key_data[i])) {
+					auto rid = static_cast<idx_t>(rid_data[i]);
+					auto word = rid / 64;
+					if (word >= filter_bitset.size()) {
+						filter_bitset.resize(word + 1, 0);
+					}
+					filter_bitset[word] |= (1ULL << (rid % 64));
+				}
+			}
+		}
+
+		result->index_state = hnsw_index.InitializeFilteredScan(bind_data.query.get(), bind_data.limit,
+		                                                        std::move(filter_bitset), context);
+	} else if (bind_data.HasFilters()) {
 		// Build a filter bitset by scanning the table with the filter predicates
 		auto &data_table = bind_data.table.GetStorage();
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);

@@ -4,6 +4,8 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -71,7 +73,7 @@ public:
 		}
 		// Look for a expression that is a distance expression
 		auto &agg = plan->Cast<LogicalAggregate>();
-		if (!agg.groups.empty() || agg.expressions.size() != 1) {
+		if (agg.expressions.size() != 1) {
 			return false;
 		}
 
@@ -98,12 +100,19 @@ public:
 			return false;
 		}
 
-		// we also need the projection to be directly on top of a table scan that has a hnsw index
-		if (agg.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
+		// The child must be a table scan (possibly through a projection for compression)
+		unique_ptr<LogicalOperator> *get_ptr_ref = &agg.children[0];
+		if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			if ((*get_ptr_ref)->children.size() != 1 ||
+			    (*get_ptr_ref)->children[0]->type != LogicalOperatorType::LOGICAL_GET) {
+				return false;
+			}
+			get_ptr_ref = &(*get_ptr_ref)->children[0];
+		} else if ((*get_ptr_ref)->type != LogicalOperatorType::LOGICAL_GET) {
 			return false;
 		}
 
-		auto &get_ptr = agg.children[0];
+		auto &get_ptr = *get_ptr_ref;
 		auto &get = get_ptr->Cast<LogicalGet>();
 		if (get.function.name != "seq_scan") {
 			return false;
@@ -146,6 +155,33 @@ public:
 				continue;
 			}
 
+			// If there's a compression projection between AGGREGATE and GET,
+			// the dist_expr's vec binding uses the projection's table_index,
+			// not the GET's. Rebind the index_expr to match.
+			if (agg.children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &compress_proj = agg.children[0]->Cast<LogicalProjection>();
+				ExpressionIterator::EnumerateExpression(index_expr, [&](Expression &child) {
+					if (child.type == ExpressionType::BOUND_COLUMN_REF) {
+						auto &ref = child.Cast<BoundColumnRefExpression>();
+						if (ref.binding.table_index == get.table_index) {
+							// Find which projection column maps to this GET column
+							auto get_col_ids = get.GetColumnIds();
+							for (idx_t i = 0; i < compress_proj.expressions.size(); i++) {
+								if (compress_proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
+									auto &proj_ref = compress_proj.expressions[i]->Cast<BoundColumnRefExpression>();
+									if (proj_ref.binding.table_index == get.table_index &&
+									    proj_ref.binding.column_index == ref.binding.column_index) {
+										ref.binding.table_index = compress_proj.table_index;
+										ref.binding.column_index = i;
+										break;
+									}
+								}
+							}
+						}
+					}
+				});
+			}
+
 			// Now, ensure that one of the bindings is a constant vector, and the other our index expression
 			auto &const_expr_ref = bindings[1];
 			auto &index_expr_ref = bindings[2];
@@ -168,9 +204,14 @@ public:
 			for (idx_t i = 0; i < vector_size; i++) {
 				query_vector[i] = vector_elements[i].GetValue<float>();
 			}
-			const auto k_limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int32_t>();
+			auto k_limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int32_t>();
 			if (k_limit <= 0 || k_limit >= STANDARD_VECTOR_SIZE) {
 				continue;
+			}
+			// For grouped aggregation, oversample to ensure each group gets enough results.
+			// Multiply k by 10 as a conservative estimate (capped at table size).
+			if (!agg.groups.empty()) {
+				k_limit = MinValue<int32_t>(k_limit * 10, STANDARD_VECTOR_SIZE - 1);
 			}
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, k_limit, std::move(query_vector));
 			break;
@@ -191,9 +232,13 @@ public:
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 
-		// Replace the aggregate with a list() aggregate function ordered by the distance
-		agg.expressions[0] = CreateListOrderByExpr(context, col_expr->Copy(), dist_expr->Copy(),
-		                                           agg_func_expr.filter ? agg_func_expr.filter->Copy() : nullptr);
+		// For ungrouped: replace min_by with LIST (index scan returns exactly K results)
+		// For grouped: keep min_by as-is (it handles per-group K internally)
+		if (agg.groups.empty()) {
+			agg.expressions[0] = CreateListOrderByExpr(context, col_expr->Copy(), dist_expr->Copy(),
+			                                           agg_func_expr.filter ? agg_func_expr.filter->Copy() : nullptr);
+		}
+		// For grouped case, min_by stays — it picks top-K per group from the oversized scan results.
 
 		return true;
 	}

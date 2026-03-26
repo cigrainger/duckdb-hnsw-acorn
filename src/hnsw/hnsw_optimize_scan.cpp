@@ -2,6 +2,7 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -73,6 +74,10 @@ public:
 
 		unique_ptr<LogicalOperator> *get_ptr_ref = &projection.children.front();
 		LogicalFilter *logical_filter = nullptr;
+		LogicalComparisonJoin *comparison_join = nullptr;
+		LogicalGet *metadata_get = nullptr;
+		idx_t indexed_join_col = DConstants::INVALID_INDEX;
+		idx_t metadata_join_col = DConstants::INVALID_INDEX;
 
 		if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_FILTER) {
 			logical_filter = &(*get_ptr_ref)->Cast<LogicalFilter>();
@@ -81,6 +86,66 @@ public:
 				return false;
 			}
 			get_ptr_ref = &logical_filter->children.front();
+		} else if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			// Metadata join: PROJECTION → JOIN → [GET(indexed), GET(metadata)]
+			comparison_join = &(*get_ptr_ref)->Cast<LogicalComparisonJoin>();
+			if (comparison_join->join_type != JoinType::INNER || comparison_join->children.size() != 2) {
+				return false;
+			}
+			// Must be a simple equi-join with one condition
+			if (comparison_join->conditions.size() != 1 ||
+			    comparison_join->conditions[0].comparison != ExpressionType::COMPARE_EQUAL) {
+				return false;
+			}
+			auto &join_cond = comparison_join->conditions[0];
+
+			// Both sides must be GET (seq_scan)
+			auto &lhs = comparison_join->children[0];
+			auto &rhs = comparison_join->children[1];
+			if (lhs->type != LogicalOperatorType::LOGICAL_GET || rhs->type != LogicalOperatorType::LOGICAL_GET) {
+				return false;
+			}
+
+			// Figure out which side has the HNSW index — we'll determine that below
+			// during index matching. For now, try the left side first.
+			// Extract join column indices from the join condition
+			if (join_cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
+			    join_cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
+				return false;
+			}
+			auto &join_left_ref = join_cond.left->Cast<BoundColumnRefExpression>();
+			auto &join_right_ref = join_cond.right->Cast<BoundColumnRefExpression>();
+
+			auto &lhs_get = lhs->Cast<LogicalGet>();
+			auto &rhs_get = rhs->Cast<LogicalGet>();
+
+			// Determine which side is the indexed table and which is the metadata table.
+			// We'll try both and see which has the HNSW index (below).
+			if (join_left_ref.binding.table_index == lhs_get.table_index) {
+				// Left side join column matches left GET → left is indexed, right is metadata
+				// Map binding column_index through GET's column_ids to table column index
+				auto lhs_col_ids = lhs_get.GetColumnIds();
+				auto rhs_col_ids = rhs_get.GetColumnIds();
+				if (join_left_ref.binding.column_index >= lhs_col_ids.size() ||
+				    join_right_ref.binding.column_index >= rhs_col_ids.size()) {
+					return false;
+				}
+				indexed_join_col = lhs_col_ids[join_left_ref.binding.column_index].GetPrimaryIndex();
+				metadata_join_col = rhs_col_ids[join_right_ref.binding.column_index].GetPrimaryIndex();
+				get_ptr_ref = &lhs;
+				metadata_get = &rhs_get;
+			} else {
+				auto lhs_col_ids = lhs_get.GetColumnIds();
+				auto rhs_col_ids = rhs_get.GetColumnIds();
+				if (join_right_ref.binding.column_index >= rhs_col_ids.size() ||
+				    join_left_ref.binding.column_index >= lhs_col_ids.size()) {
+					return false;
+				}
+				indexed_join_col = rhs_col_ids[join_right_ref.binding.column_index].GetPrimaryIndex();
+				metadata_join_col = lhs_col_ids[join_left_ref.binding.column_index].GetPrimaryIndex();
+				get_ptr_ref = &rhs;
+				metadata_get = &lhs_get;
+			}
 		} else if ((*get_ptr_ref)->type != LogicalOperatorType::LOGICAL_GET) {
 			return false;
 		}
@@ -165,6 +230,38 @@ public:
 			return false;
 		}
 
+		// If this is a metadata join, populate the join info in bind_data
+		if (comparison_join && metadata_get) {
+			auto &meta_table = *metadata_get->GetTable();
+			if (!meta_table.IsDuckTable()) {
+				return false;
+			}
+			bind_data->metadata_table = &meta_table;
+			bind_data->indexed_join_column = indexed_join_col;
+			bind_data->metadata_join_column = metadata_join_col;
+
+			// Set up metadata scan: reuse ExtractFiltersIntoBind pattern for filter columns,
+			// then prepend the join key column.
+			auto &meta_duck_table = meta_table.Cast<DuckTableEntry>();
+
+			// Set up metadata scan columns: join key at position 0, then filter columns.
+			// Filter keys must be remapped to positions in our scan column_ids vector
+			// (DuckDB's TableFilterSet keys are indices into the column_ids vector).
+			auto &meta_join_col = meta_duck_table.GetColumn(LogicalIndex(metadata_join_col));
+			bind_data->metadata_scan_column_ids.emplace_back(StorageIndex(meta_join_col.StorageOid()));
+			bind_data->metadata_scan_types.push_back(meta_join_col.GetType());
+
+			idx_t meta_scan_pos = 1; // filter columns start after join key
+			for (const auto &entry : metadata_get->table_filters.filters) {
+				auto table_col_idx = entry.first;
+				auto &col = meta_duck_table.GetColumn(LogicalIndex(table_col_idx));
+				bind_data->metadata_scan_column_ids.emplace_back(StorageIndex(col.StorageOid()));
+				bind_data->metadata_scan_types.push_back(col.GetType());
+				bind_data->metadata_filters.filters[meta_scan_pos] = entry.second->Copy();
+				meta_scan_pos++;
+			}
+		}
+
 		// Push table filters into the bind data for filtered HNSW search
 		ExtractFiltersIntoBind(duck_table, get, *bind_data);
 
@@ -173,6 +270,15 @@ public:
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
+
+		if (comparison_join) {
+			// Metadata join: keep the JOIN but remove the TOP_N.
+			// The HNSW_INDEX_SCAN (with metadata-derived bitset) handles the limit.
+			// The JOIN re-attaches metadata columns to the HNSW results.
+			plan = std::move(top_n.children[0]);
+			return true;
+		}
+
 		if (get.table_filters.filters.empty()) {
 			// No filters — just remove TopN
 			plan = std::move(top_n.children[0]);
