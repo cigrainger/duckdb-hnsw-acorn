@@ -588,41 +588,12 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	index_join->inner_vector_column = inner_ref_expr.binding.column_index;
 
 	// -------------------------------------------------------------------------
-	// Build replacement plan.
+	// Build replacement plan: replace PROJECTION + DELIM_JOIN with
+	//   PROJECTION (same table_index) → HNSW_INDEX_JOIN → SEQ_SCAN (outer)
 	//
-	// The LogicalHNSWIndexJoin produces columns:
-	//   [inner_cols...] [row_number(BIGINT)] [outer_cols...]
-	//
-	// The DELIM_JOIN currently exposes:
-	//   [inner_side_bindings...] [outer_side_bindings...]
-	// where inner_side_bindings come from the UNNEST/AGG subtree.
-	//
-	// Strategy: capture the DELIM_JOIN's output bindings, create the index
-	// join, wrap it in a projection that maps the old bindings to the new
-	// index join bindings, then replace the DELIM_JOIN with this projection.
+	// Resolve each top_proj expression through the intermediate projection
+	// chain to map struct-unpacked UNNEST refs to index join columns.
 	// -------------------------------------------------------------------------
-
-	// -------------------------------------------------------------------------
-	// Build replacement plan.
-	//
-	// We replace the entire top PROJECTION + DELIM_JOIN subtree with:
-	//   PROJECTION (same table_index as top_proj, same output bindings)
-	//     → HNSW_INDEX_JOIN
-	//         → SEQ_SCAN (outer table)
-	//
-	// The top_proj's expressions reference the DELIM_JOIN's outputs (which
-	// include struct field accesses into UNNEST results). We resolve each
-	// expression to an index join column reference.
-	// -------------------------------------------------------------------------
-
-	// The index join output layout:
-	//   Left:  [inner_col_0, inner_col_1, ...] [row_number]
-	//   Right: [outer_col_0, outer_col_1, ...]
-	auto ij_left = index_join->GetLeftBindings();  // doesn't need children
-	auto ij_right = outer_get.GetColumnBindings();
-
-	// Build mapping: inner table bindings → index join left columns
-	// inner_get table_index → index_join table_index
 	auto ij_table = index_join->table_index;
 
 	// Build mapping: for each column in the inner table, what's its index in the join output?
@@ -798,7 +769,8 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 			new_exprs.push_back(std::move(resolved));
 		} else {
 			// Non-ref expression (e.g., arithmetic on lateral outputs).
-			// Walk all column refs inside and resolve them.
+			// Walk all column refs inside and remap them. If any ref points to
+			// an internal table we can't resolve, bail out.
 			auto new_expr = expr->Copy();
 			bool expr_failed = false;
 			ExpressionIterator::EnumerateExpression(new_expr, [&](Expression &child) {
@@ -806,13 +778,16 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 					return;
 				}
 				auto &cr = child.Cast<BoundColumnRefExpression>();
-				// Remap known table indices
 				if (cr.binding.table_index == inner_get_table) {
 					cr.binding.table_index = ij_table;
 				} else if (cr.binding.table_index == delim_get_table) {
 					cr.binding.table_index = outer_get_table;
+				} else if (cr.binding.table_index != outer_get_table &&
+				           cr.binding.table_index != ij_table) {
+					// References an old internal table (UNNEST, AGG, intermediate proj)
+					// that we can't remap in this context — bail out.
+					expr_failed = true;
 				}
-				// If it still references an old internal table, bail
 			});
 			if (expr_failed) {
 				resolution_failed = true;
