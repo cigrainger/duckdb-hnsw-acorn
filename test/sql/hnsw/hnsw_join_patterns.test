@@ -1,0 +1,207 @@
+# name: test/sql/hnsw/hnsw_join_patterns.test
+# description: Test HNSW index usage across different join patterns
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE data AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec
+FROM range(500) t(i);
+
+statement ok
+CREATE TABLE queries AS
+SELECT i AS qid,
+    array_value(((i * 3) % 10)::FLOAT, ((i * 11) % 13)::FLOAT, ((i * 7) % 17)::FLOAT) AS qvec
+FROM range(5) t(i);
+
+# Capture brute-force baseline (no index)
+statement ok
+CREATE TABLE brute_force AS
+SELECT q.qid, sub.id
+FROM queries q, LATERAL (
+    SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 3
+) sub;
+
+statement ok
+CREATE INDEX idx ON data USING HNSW (vec);
+
+# ==================================================================
+# 1. Lateral join uses HNSW index (EXPLAIN check)
+# ==================================================================
+query II
+EXPLAIN SELECT q.qid, sub.id
+FROM queries q, LATERAL (
+    SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 3
+) sub;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+# ==================================================================
+# 2. Lateral join results match brute force
+# ==================================================================
+statement ok
+CREATE TABLE index_results AS
+SELECT q.qid, sub.id
+FROM queries q, LATERAL (
+    SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 3
+) sub;
+
+# Correct count (5 queries × 3 results)
+query I
+SELECT count(*) FROM index_results;
+----
+15
+
+# High recall: at least 12 of 15 results match brute force
+# (HNSW is approximate, so exact match isn't guaranteed)
+query I
+SELECT (SELECT count(*) FROM brute_force bf
+WHERE EXISTS (SELECT 1 FROM index_results ir WHERE ir.qid = bf.qid AND ir.id = bf.id)) >= 12;
+----
+true
+
+statement ok
+DROP TABLE index_results;
+
+# ==================================================================
+# 3. Lateral join with different LIMIT values
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT q.qid, sub.id
+    FROM queries q, LATERAL (
+        SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 1
+    ) sub
+);
+----
+5
+
+query I
+SELECT count(*) FROM (
+    SELECT q.qid, sub.id
+    FROM queries q, LATERAL (
+        SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 10
+    ) sub
+);
+----
+50
+
+# ==================================================================
+# 4. Lateral join with cosine metric
+# ==================================================================
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE INDEX idx_cos ON data USING HNSW (vec) WITH (metric = 'cosine');
+
+query I
+SELECT count(*) FROM (
+    SELECT q.qid, sub.id
+    FROM queries q, LATERAL (
+        SELECT id FROM data ORDER BY array_cosine_distance(q.qvec, data.vec) LIMIT 3
+    ) sub
+);
+----
+15
+
+statement ok
+DROP INDEX idx_cos;
+
+# ==================================================================
+# 5. Lateral join with RaBitQ
+# ==================================================================
+statement ok
+CREATE INDEX idx_rq ON data USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT q.qid, sub.id
+    FROM queries q, LATERAL (
+        SELECT id FROM data ORDER BY array_distance(q.qvec, data.vec) LIMIT 3
+    ) sub
+);
+----
+15
+
+statement ok
+DROP INDEX idx_rq;
+
+# ==================================================================
+# 6. Metadata join (correctness — seq scan expected, not HNSW)
+# ==================================================================
+statement ok
+CREATE TABLE metadata AS
+SELECT i AS id, (i % 5) AS category, 'item_' || i AS name
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_meta ON data USING HNSW (vec);
+
+# Cross-table join with WHERE filter — falls back to seq scan
+# (no HNSW_INDEX_JOIN or HNSW_INDEX_SCAN for cross-table joins)
+# Just verify it returns correct results
+query I
+SELECT count(*) FROM (
+    SELECT m.name, m.category
+    FROM data d
+    JOIN metadata m ON d.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(d.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# All results satisfy the filter
+query I
+SELECT count(*) FROM (
+    SELECT m.name, m.category
+    FROM data d
+    JOIN metadata m ON d.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(d.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+statement ok
+DROP INDEX idx_meta;
+
+# ==================================================================
+# 7. GROUP BY + min_by on single table (TopK optimizer)
+# ==================================================================
+statement ok
+CREATE TABLE grouped AS
+SELECT i AS id,
+    array_value((i % 10)::FLOAT, ((i * 7) % 13)::FLOAT, ((i * 3) % 17)::FLOAT) AS vec,
+    (i % 5) AS cat
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_grouped ON grouped USING HNSW (vec);
+
+# Single-table min_by uses the TopK optimizer (not the join optimizer)
+query I
+SELECT count(*) FROM (
+    SELECT min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM grouped
+);
+----
+1
+
+# With GROUP BY — seq scan expected (grouped TopK not yet optimized)
+query I
+SELECT count(*) FROM (
+    SELECT cat, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) AS closest
+    FROM grouped
+    GROUP BY cat
+);
+----
+5
