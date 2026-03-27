@@ -262,6 +262,9 @@ public:
 		// For grouped: fix stale compression statistics. DuckDB's statistics
 		// propagation may have used cached stats from a previously dropped table
 		// to compute compression min_val. Refresh it from the current table stats.
+		// NOTE: This patches __internal_compress_integral_* and __internal_decompress_integral_*
+		// functions by name. Coupled to DuckDB internals (tested against DuckDB v1.2.1).
+		// If these function names change, the fix silently becomes a no-op (safe but stale).
 		if (!agg.groups.empty() && has_compression_proj) {
 			// Get fresh statistics for the group column from the current table
 			auto &scan_bind = get.bind_data->Cast<HNSWIndexScanBindData>();
@@ -348,15 +351,30 @@ public:
 		}
 	}
 
-	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	static bool OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		bool any_grouped = false;
 		if (!TryOptimize(input.optimizer.binder, input.context, plan)) {
-			// Recursively optimize the children
 			for (auto &child : plan->children) {
-				Optimize(input, child);
+				any_grouped |= OptimizeRecursive(input, child);
+			}
+		} else {
+			// Check if the successful optimization was a grouped search
+			if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				auto &agg = plan->Cast<LogicalAggregate>();
+				if (!agg.groups.empty()) {
+					any_grouped = true;
+				}
 			}
 		}
-		// After optimization, fix decompress projections with fresh statistics
-		FixDecompressProjections(input.context, plan);
+		// Only fix decompress projections if a grouped search was optimized in this subtree
+		if (any_grouped) {
+			FixDecompressProjections(input.context, plan);
+		}
+		return any_grouped;
+	}
+
+	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		OptimizeRecursive(input, plan);
 	}
 };
 

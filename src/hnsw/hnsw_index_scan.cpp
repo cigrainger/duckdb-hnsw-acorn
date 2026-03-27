@@ -22,6 +22,16 @@
 
 namespace duckdb {
 
+// Set a bit in a dynamically-sized bitset, resizing if needed.
+// Used by grouped scan, metadata join, and filtered scan to build ACORN-1 filter bitsets.
+static void SetBit(vector<uint64_t> &bitset, idx_t rid) {
+	auto word = rid / 64;
+	if (word >= bitset.size()) {
+		bitset.resize(word + 1, 0);
+	}
+	bitset[word] |= (1ULL << (rid % 64));
+}
+
 void ExtractFiltersIntoBind(DuckTableEntry &duck_table, LogicalGet &get, HNSWIndexScanBindData &bind_data) {
 	if (get.table_filters.filters.empty()) {
 		return;
@@ -121,9 +131,11 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 
 		auto total_rows = data_table.GetTotalRows();
 
-		// Build per-group row_id sets. We use the row_id as the group key
-		// since group values can be any type. Map: group_key → list of row_ids.
-		// We partition by hash of the group value for type-agnostic grouping.
+		// Build per-group row_id sets using Value::ToString() as the group key.
+		// This is type-agnostic (works for integers, strings, etc.) but assumes
+		// no collisions in string representation across distinct values of the
+		// same type. This holds for all DuckDB scalar types. Performance is
+		// acceptable for moderate group cardinality (hundreds, not millions).
 		vector<vector<idx_t>> group_list; // ordered list of groups
 		unordered_map<string, idx_t> group_value_to_idx; // serialized value → group index
 
@@ -197,11 +209,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			// Build bitset for this group
 			vector<uint64_t> group_bitset((total_rows / 64) + 1, 0);
 			for (auto rid : row_ids) {
-				auto word = rid / 64;
-				if (word >= group_bitset.size()) {
-					group_bitset.resize(word + 1, 0);
-				}
-				group_bitset[word] |= (1ULL << (rid % 64));
+				SetBit(group_bitset, rid);
 			}
 
 			// Run ACORN-1 filtered search for this group
@@ -219,32 +227,17 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			}
 		}
 
-		// Create a scan state that returns these pre-computed row_ids
-		// We use InitializeScan with the full result set — the min_by aggregate
-		// above will handle per-group selection.
-		if (!all_result_row_ids.empty()) {
-			// Build a bitset from all per-group results
-			vector<uint64_t> combined_bitset((total_rows / 64) + 1, 0);
-			for (auto rid : all_result_row_ids) {
-				auto word = static_cast<idx_t>(rid) / 64;
-				if (word >= combined_bitset.size()) {
-					combined_bitset.resize(word + 1, 0);
-				}
-				combined_bitset[word] |= (1ULL << (static_cast<idx_t>(rid) % 64));
-			}
-			// Use a large limit to return all per-group results
-			auto total_limit = all_result_row_ids.size();
-			result->index_state = hnsw_index.InitializeFilteredScan(
-			    bind_data.query.get(), total_limit, std::move(combined_bitset), context);
-		} else {
-			result->index_state = hnsw_index.InitializeScan(bind_data.query.get(), 0, context);
-		}
+		// Return pre-computed row_ids directly — no need for a second HNSW search.
+		// The min_by aggregate above handles per-group selection.
+		result->index_state = hnsw_index.InitializeFromRowIds(std::move(all_result_row_ids));
 	} else if (bind_data.HasMetadataJoin()) {
 		// Metadata join: scan the metadata table with its filters to get matching
 		// join keys, then look up which row_ids in the indexed table have those
 		// keys, and build a filter bitset for ACORN-1 filtered search.
 		auto &data_table = bind_data.table.GetStorage();
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+		// const_cast needed: DuckDB's CatalogEntry returns const from Cast(), but
+		// GetStorage() requires non-const access for scan initialization.
 		auto &meta_table_entry = const_cast<DuckTableEntry &>(bind_data.metadata_table->Cast<DuckTableEntry>());
 		auto &meta_data_table = meta_table_entry.GetStorage();
 
@@ -257,6 +250,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		meta_data_table.InitializeScan(context, transaction, meta_scan_state, meta_scan_col_ids,
 		                               &bind_data.metadata_filters);
 
+		// Limitation: join keys are read as int64_t — only BIGINT join columns are
+		// supported. The optimizer validates this at match time (hnsw_optimize_scan.cpp).
+		// Supporting INTEGER/UUID would require type-dispatched key reading here.
 		unordered_set<int64_t> matching_keys;
 		DataChunk meta_chunk;
 		meta_chunk.Initialize(context, meta_scan_types);
@@ -304,12 +300,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			auto rid_data = FlatVector::GetData<row_t>(idx_chunk.data[1]);
 			for (idx_t i = 0; i < idx_chunk.size(); i++) {
 				if (matching_keys.count(key_data[i])) {
-					auto rid = static_cast<idx_t>(rid_data[i]);
-					auto word = rid / 64;
-					if (word >= filter_bitset.size()) {
-						filter_bitset.resize(word + 1, 0);
-					}
-					filter_bitset[word] |= (1ULL << (rid % 64));
+					SetBit(filter_bitset, static_cast<idx_t>(rid_data[i]));
 				}
 			}
 		}
@@ -340,11 +331,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				}
 				auto rid_data = FlatVector::GetData<row_t>(base_chunk.data[base_rid_col]);
 				for (idx_t i = 0; i < base_chunk.size(); i++) {
-					auto rid = static_cast<idx_t>(rid_data[i]);
-					auto word = rid / 64;
-					if (word < base_bitset.size()) {
-						base_bitset[word] |= (1ULL << (rid % 64));
-					}
+					SetBit(base_bitset, static_cast<idx_t>(rid_data[i]));
 				}
 			}
 			// Intersect: keep only rows that pass BOTH metadata join AND base-table filters
@@ -390,12 +377,7 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			}
 			auto row_id_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col_idx]);
 			for (idx_t i = 0; i < scan_chunk.size(); i++) {
-				auto rid = static_cast<idx_t>(row_id_data[i]);
-				auto word = rid / 64;
-				if (word >= filter_bitset.size()) {
-					filter_bitset.resize(word + 1, 0);
-				}
-				filter_bitset[word] |= (1ULL << (rid % 64));
+				SetBit(filter_bitset, static_cast<idx_t>(row_id_data[i]));
 			}
 		}
 

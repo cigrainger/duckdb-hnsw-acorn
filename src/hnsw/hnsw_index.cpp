@@ -492,6 +492,15 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 	return std::move(state);
 }
 
+unique_ptr<IndexScanState> HNSWIndex::InitializeFromRowIds(vector<row_t> row_ids) {
+	auto state = make_uniq<HNSWIndexScanState>();
+	state->current_row = 0;
+	state->total_rows = row_ids.size();
+	state->row_ids = make_uniq_array<row_t>(row_ids.size());
+	memcpy(state->row_ids.get(), row_ids.data(), row_ids.size() * sizeof(row_t));
+	return std::move(state);
+}
+
 unique_ptr<IndexScanState> HNSWIndex::InitializeFilteredScan(float *query_vector, idx_t limit,
                                                              vector<uint64_t> filter_bitset, ClientContext &context) {
 	auto state = make_uniq<HNSWIndexScanState>();
