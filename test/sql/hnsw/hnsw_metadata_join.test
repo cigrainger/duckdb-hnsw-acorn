@@ -4,9 +4,9 @@
 
 require hnsw_acorn
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Setup: embeddings table with HNSW index, separate metadata table
-# ------------------------------------------------------------------
+# ==================================================================
 statement ok
 CREATE TABLE embeddings AS
 SELECT i AS id, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec
@@ -14,14 +14,14 @@ FROM range(500) t(i);
 
 statement ok
 CREATE TABLE metadata AS
-SELECT i AS id, (i % 5) AS category, 'item_' || i AS name
+SELECT i AS id, (i % 5) AS category, (i % 3) AS tag, 'item_' || i AS name
 FROM range(500) t(i);
 
 statement ok
 CREATE INDEX idx ON embeddings USING HNSW (vec);
 
 # ==================================================================
-# 1. Optimizer uses HNSW index for metadata join
+# 1. EXPLAIN shows HNSW_INDEX_SCAN (optimizer rewrite fires)
 # ==================================================================
 query II
 EXPLAIN SELECT m.name, m.category
@@ -32,8 +32,18 @@ LIMIT 5;
 ----
 physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
 
+# Reversed table order — should still fire
+query II
+EXPLAIN SELECT m.name
+FROM metadata m JOIN embeddings e ON m.id = e.id
+WHERE m.category = 2
+ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
 # ==================================================================
-# 2. Results match brute force exactly
+# 2. Exact match with brute force (L2sq)
 # ==================================================================
 
 # With index (HNSW + ACORN-1)
@@ -57,10 +67,16 @@ WHERE m.category = 1
 ORDER BY dist
 LIMIT 10;
 
-# Exact match
+# Every indexed result must appear in brute force results
 query I
 SELECT count(*) FROM idx_results ir
 WHERE EXISTS (SELECT 1 FROM bf_results bf WHERE bf.name = ir.name AND bf.dist = ir.dist);
+----
+10
+
+# Same count
+query I
+SELECT count(*) FROM idx_results;
 ----
 10
 
@@ -74,7 +90,7 @@ statement ok
 CREATE INDEX idx ON embeddings USING HNSW (vec);
 
 # ==================================================================
-# 3. All results satisfy the metadata filter
+# 3. All results satisfy the metadata filter (filter correctness)
 # ==================================================================
 query I
 SELECT count(*) FROM (
@@ -87,8 +103,20 @@ SELECT count(*) FROM (
 ----
 0
 
+# Different category
+query I
+SELECT count(*) FROM (
+    SELECT m.name, m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [5.0, 10.0, 15.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 3;
+----
+0
+
 # ==================================================================
-# 4. Results are ordered by distance
+# 4. Results are ordered by distance (monotone non-decreasing)
 # ==================================================================
 query I
 SELECT bool_and(d1 <= d2) FROM (
@@ -104,21 +132,66 @@ SELECT bool_and(d1 <= d2) FROM (
 true
 
 # ==================================================================
-# 5. Different filter values
+# 5. Different filter values (category = 0, 1, 2, 3, 4)
 # ==================================================================
 query I
 SELECT count(*) FROM (
     SELECT m.name
     FROM embeddings e JOIN metadata m ON e.id = m.id
-    WHERE m.category = 3
+    WHERE m.category = 0
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2
     ORDER BY array_distance(e.vec, [5.0, 10.0, 15.0]::FLOAT[3])
     LIMIT 5
 ) sub;
 ----
 5
 
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 4
+    ORDER BY array_distance(e.vec, [10.0, 20.0, 30.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+# Each result actually has the correct category
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 0
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub WHERE sub.category != 0;
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 4
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub WHERE sub.category != 4;
+----
+0
+
 # ==================================================================
-# 6. Filter returns no matches
+# 6. Filter returns no matches (category = 99 → 0 rows)
 # ==================================================================
 query I
 SELECT count(*) FROM (
@@ -132,7 +205,7 @@ SELECT count(*) FROM (
 0
 
 # ==================================================================
-# 7. Metadata join with cosine metric
+# 7. Cosine metric
 # ==================================================================
 statement ok
 DROP INDEX idx;
@@ -140,6 +213,17 @@ DROP INDEX idx;
 statement ok
 CREATE INDEX idx_cos ON embeddings USING HNSW (vec) WITH (metric = 'cosine');
 
+# EXPLAIN still shows HNSW_INDEX_SCAN
+query II
+EXPLAIN SELECT m.name
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 2
+ORDER BY array_cosine_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns correct count
 query I
 SELECT count(*) FROM (
     SELECT m.name
@@ -151,15 +235,105 @@ SELECT count(*) FROM (
 ----
 5
 
+# Filter correctness
+query I
+SELECT count(*) FROM (
+    SELECT m.name, m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2
+    ORDER BY array_cosine_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 2;
+----
+0
+
+# Cosine results ordered
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_cosine_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_cosine_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2
+    ORDER BY array_cosine_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# Cosine brute force match — use non-collinear vectors to avoid
+# degenerate ties (all vectors at cosine distance 0)
 statement ok
 DROP INDEX idx_cos;
 
+statement ok
+DROP TABLE embeddings;
+
+statement ok
+CREATE TABLE embeddings AS
+SELECT i AS id, array_value(
+    (i % 10 + 1)::FLOAT,
+    ((i * 7) % 13 + 1)::FLOAT,
+    ((i * 3) % 17 + 1)::FLOAT
+) AS vec FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_cos ON embeddings USING HNSW (vec) WITH (metric = 'cosine');
+
+statement ok
+CREATE TABLE cos_idx_results AS
+SELECT m.name, array_cosine_distance(e.vec, [1.0, 5.0, 10.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 1
+ORDER BY dist LIMIT 10;
+
+statement ok
+DROP INDEX idx_cos;
+
+statement ok
+CREATE TABLE cos_bf_results AS
+SELECT m.name, array_cosine_distance(e.vec, [1.0, 5.0, 10.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 1
+ORDER BY dist LIMIT 10;
+
+query I
+SELECT count(*) FROM cos_idx_results ir
+WHERE EXISTS (SELECT 1 FROM cos_bf_results bf WHERE bf.name = ir.name);
+----
+10
+
+statement ok
+DROP TABLE cos_idx_results;
+
+statement ok
+DROP TABLE cos_bf_results;
+
+statement ok
+DROP TABLE embeddings;
+
+statement ok
+CREATE TABLE embeddings AS
+SELECT i AS id, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec
+FROM range(500) t(i);
+
 # ==================================================================
-# 8. Metadata join with RaBitQ
+# 8. RaBitQ quantization
 # ==================================================================
 statement ok
 CREATE INDEX idx_rq ON embeddings USING HNSW (vec) WITH (quantization = 'rabitq');
 
+# EXPLAIN check
+query II
+EXPLAIN SELECT m.name
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 4
+ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns results
 query I
 SELECT count(*) FROM (
     SELECT m.name
@@ -171,7 +345,7 @@ SELECT count(*) FROM (
 ----
 5
 
-# All results satisfy filter
+# Filter correctness with RaBitQ
 query I
 SELECT count(*) FROM (
     SELECT m.name, m.category
@@ -183,6 +357,20 @@ SELECT count(*) FROM (
 ----
 0
 
+# Ordering with RaBitQ
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 4
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
 statement ok
 DROP INDEX idx_rq;
 
@@ -192,9 +380,11 @@ DROP INDEX idx_rq;
 statement ok
 CREATE INDEX idx ON embeddings USING HNSW (vec);
 
+# All metadata columns
 query I
 SELECT count(*) FROM (
-    SELECT e.id, e.vec, m.name, m.category, array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+    SELECT e.id, e.vec, m.name, m.category, m.tag,
+           array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
     FROM embeddings e JOIN metadata m ON e.id = m.id
     WHERE m.category = 0
     ORDER BY dist
@@ -203,8 +393,32 @@ SELECT count(*) FROM (
 ----
 5
 
+# Verify the columns carry correct data
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.name, m.category, m.tag
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub WHERE sub.name != ('item_' || sub.id) OR sub.category != 2;
+----
+0
+
+# tag column is consistent with id
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.tag
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.tag != (sub.id % 3);
+----
+0
+
 # ==================================================================
-# 10. Range filter on metadata
+# 10. Range filter (BETWEEN)
 # ==================================================================
 query I
 SELECT count(*) FROM (
@@ -216,3 +430,537 @@ SELECT count(*) FROM (
 ) sub;
 ----
 10
+
+# Filter correctness: all results have category in [1,2]
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category BETWEEN 1 AND 2
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category < 1 OR sub.category > 2;
+----
+0
+
+# Range filter exact match vs brute force
+statement ok
+CREATE TABLE range_idx AS
+SELECT m.name, array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category BETWEEN 2 AND 3
+ORDER BY dist
+LIMIT 10;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE range_bf AS
+SELECT m.name, array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category BETWEEN 2 AND 3
+ORDER BY dist
+LIMIT 10;
+
+query I
+SELECT count(*) FROM range_idx ir
+WHERE EXISTS (SELECT 1 FROM range_bf bf WHERE bf.name = ir.name AND bf.dist = ir.dist);
+----
+10
+
+statement ok
+DROP TABLE range_idx;
+
+statement ok
+DROP TABLE range_bf;
+
+statement ok
+CREATE INDEX idx ON embeddings USING HNSW (vec);
+
+# ==================================================================
+# 11. Compound filter (AND on metadata)
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1 AND m.tag = 0
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+# Every result satisfies both predicates
+query I
+SELECT count(*) FROM (
+    SELECT m.category, m.tag
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1 AND m.tag = 0
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 1 OR sub.tag != 0;
+----
+0
+
+# Compound filter with BETWEEN + equality
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category BETWEEN 0 AND 2 AND m.tag = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 8
+) sub;
+----
+8
+
+query I
+SELECT count(*) FROM (
+    SELECT m.category, m.tag
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category BETWEEN 0 AND 2 AND m.tag = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 8
+) sub WHERE sub.category < 0 OR sub.category > 2 OR sub.tag != 1;
+----
+0
+
+# ==================================================================
+# 12. Non-1:1 join (metadata has duplicates) — TOP_N prevents excess
+# ==================================================================
+statement ok
+CREATE TABLE meta_dupes AS
+SELECT * FROM metadata
+UNION ALL
+SELECT i AS id, (i % 5) AS category, (i % 3) AS tag, 'dupe_' || i AS name
+FROM range(500) t(i);
+
+# Each id now has 2 rows in meta_dupes. Without TOP_N, the join
+# would produce 2x rows. LIMIT should cap the result.
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN meta_dupes m ON e.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub;
+----
+10
+
+# Filter still correct with duplicates
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN meta_dupes m ON e.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 1;
+----
+0
+
+# LIMIT 5 with dupes
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN meta_dupes m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+statement ok
+DROP TABLE meta_dupes;
+
+# ==================================================================
+# 13. Empty metadata table
+# ==================================================================
+statement ok
+CREATE TABLE meta_empty (id BIGINT, category INTEGER, name VARCHAR);
+
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN meta_empty m ON e.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+0
+
+# No filter — still empty (inner join with empty table)
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN meta_empty m ON e.id = m.id
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+0
+
+statement ok
+DROP TABLE meta_empty;
+
+# ==================================================================
+# 14. Large dataset (2000+ rows) for recall verification
+# ==================================================================
+statement ok
+DROP INDEX idx;
+
+statement ok
+DROP TABLE embeddings;
+
+statement ok
+DROP TABLE metadata;
+
+statement ok
+CREATE TABLE embeddings AS
+SELECT i AS id, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec
+FROM range(2500) t(i);
+
+statement ok
+CREATE TABLE metadata AS
+SELECT i AS id, (i % 10) AS category, (i % 4) AS tag, 'item_' || i AS name
+FROM range(2500) t(i);
+
+statement ok
+CREATE INDEX idx ON embeddings USING HNSW (vec);
+
+# Count
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub;
+----
+20
+
+# Filter correctness at scale
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 7
+    ORDER BY array_distance(e.vec, [50.0, 100.0, 150.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE sub.category != 7;
+----
+0
+
+# Brute force recall check at scale
+statement ok
+CREATE TABLE large_idx AS
+SELECT m.name, array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 5
+ORDER BY dist
+LIMIT 20;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE large_bf AS
+SELECT m.name, array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 5
+ORDER BY dist
+LIMIT 20;
+
+query I
+SELECT count(*) FROM large_idx ir
+WHERE EXISTS (SELECT 1 FROM large_bf bf WHERE bf.name = ir.name AND bf.dist = ir.dist);
+----
+20
+
+statement ok
+DROP TABLE large_idx;
+
+statement ok
+DROP TABLE large_bf;
+
+statement ok
+CREATE INDEX idx ON embeddings USING HNSW (vec);
+
+# Ordering at scale
+query I
+SELECT bool_and(d1 <= d2) FROM (
+    SELECT
+        array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS d1,
+        LEAD(array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])) OVER () AS d2
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 9
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 20
+) sub WHERE d2 IS NOT NULL;
+----
+true
+
+# ==================================================================
+# 15. Base-table filter combined with metadata filter
+# ==================================================================
+
+# Filter on BOTH the embeddings table (e.id > 500) and metadata table
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.name, m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1 AND e.id > 500
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub;
+----
+10
+
+# All results satisfy both conditions
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1 AND e.id > 500
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 1 OR sub.id <= 500;
+----
+0
+
+# e.id range + metadata category
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2 AND e.id BETWEEN 100 AND 400
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 5
+) sub WHERE sub.category != 2 OR sub.id < 100 OR sub.id > 400;
+----
+0
+
+# ==================================================================
+# 16. Different query vectors
+# ==================================================================
+
+# Query near origin
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 0
+    ORDER BY array_distance(e.vec, [0.0, 0.0, 0.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+# Query at large values
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [1000.0, 2000.0, 3000.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+# Query with negative values
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 4
+    ORDER BY array_distance(e.vec, [-10.0, -20.0, -30.0]::FLOAT[3])
+    LIMIT 5
+) sub;
+----
+5
+
+# Filter correctness with different query vectors
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 6
+    ORDER BY array_distance(e.vec, [500.0, 1000.0, 1500.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 6;
+----
+0
+
+# ==================================================================
+# 17. LIMIT 1 (minimum)
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 1
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 1
+);
+----
+1
+
+# LIMIT 1 filter correctness
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 8
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 1
+) sub WHERE sub.category != 8;
+----
+0
+
+# ==================================================================
+# 18. LIMIT larger than matching rows
+# ==================================================================
+
+# category=0 with 2500 rows and 10 categories → 250 matching rows
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 0
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 1000
+);
+----
+250
+
+# Very restrictive compound filter: few matches, LIMIT much larger
+# category=1 AND tag=0 AND id BETWEEN 0 AND 99 → ids where i%10=1 AND i%4=0 AND i<100
+# i%10=1 AND i%4=0 → i∈{21, 61} (checking: 1%4=1 no, 21%4=1 no, 41%4=1 no, 61%4=1 no, 81%4=1 no)
+# Actually: i%10=1 AND i%4=0 → need i≡1 mod10 AND i≡0 mod4. No solutions (1 mod4 ≠ 0).
+# Use: category=0 AND tag=0 AND id BETWEEN 0 AND 99 → i%10=0 AND i%4=0 → i∈{0,20,40,60,80} = 5 matches
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 0 AND m.tag = 0 AND e.id BETWEEN 0 AND 99
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 1000
+) sub;
+----
+5
+
+# Verify results satisfy all filters
+query I
+SELECT count(*) FROM (
+    SELECT e.id, m.category, m.tag
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 0 AND m.tag = 0 AND e.id BETWEEN 0 AND 99
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 1000
+) sub WHERE sub.category != 0 OR sub.tag != 0 OR sub.id < 0 OR sub.id > 99;
+----
+0
+
+# ==================================================================
+# 19. Additional invariants and edge cases
+# ==================================================================
+
+# No WHERE clause on metadata — should still use the index (unfiltered join)
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+);
+----
+10
+
+# Distance values are non-negative (L2sq is always >= 0)
+query I
+SELECT count(*) FROM (
+    SELECT array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3]) AS dist
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 2
+    ORDER BY dist
+    LIMIT 10
+) sub WHERE sub.dist < 0;
+----
+0
+
+# Results from different categories are disjoint
+statement ok
+CREATE TABLE cat1_results AS
+SELECT e.id FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 1
+ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+statement ok
+CREATE TABLE cat2_results AS
+SELECT e.id FROM embeddings e JOIN metadata m ON e.id = m.id
+WHERE m.category = 2
+ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
+
+query I
+SELECT count(*) FROM cat1_results c1
+WHERE EXISTS (SELECT 1 FROM cat2_results c2 WHERE c2.id = c1.id);
+----
+0
+
+statement ok
+DROP TABLE cat1_results;
+
+statement ok
+DROP TABLE cat2_results;
+
+# ==================================================================
+# 20. RaBitQ + L2sq + metadata join combo (cosine skipped here because
+# the large dataset uses collinear vectors [i, 2i, 3i] which are
+# degenerate for cosine distance — see cosine test section above)
+# ==================================================================
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE INDEX idx_rq ON embeddings USING HNSW (vec) WITH (quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT m.name
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub;
+----
+10
+
+query I
+SELECT count(*) FROM (
+    SELECT m.category
+    FROM embeddings e JOIN metadata m ON e.id = m.id
+    WHERE m.category = 3
+    ORDER BY array_distance(e.vec, [1.0, 2.0, 3.0]::FLOAT[3])
+    LIMIT 10
+) sub WHERE sub.category != 3;
+----
+0
+
+statement ok
+DROP INDEX idx_rq;
+
+# Cleanup
+statement ok
+DROP TABLE embeddings;
+
+statement ok
+DROP TABLE metadata;

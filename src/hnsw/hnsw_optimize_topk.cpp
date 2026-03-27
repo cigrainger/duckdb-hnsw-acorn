@@ -4,6 +4,7 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -12,6 +13,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 #include "hnsw/hnsw.hpp"
@@ -102,7 +104,9 @@ public:
 
 		// The child must be a table scan (possibly through a projection for compression)
 		unique_ptr<LogicalOperator> *get_ptr_ref = &agg.children[0];
+		bool has_compression_proj = false;
 		if ((*get_ptr_ref)->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			has_compression_proj = true;
 			if ((*get_ptr_ref)->children.size() != 1 ||
 			    (*get_ptr_ref)->children[0]->type != LogicalOperatorType::LOGICAL_GET) {
 				return false;
@@ -255,6 +259,41 @@ public:
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 
+		// For grouped: fix stale compression statistics. DuckDB's statistics
+		// propagation may have used cached stats from a previously dropped table
+		// to compute compression min_val. Refresh it from the current table stats.
+		if (!agg.groups.empty() && has_compression_proj) {
+			// Get fresh statistics for the group column from the current table
+			auto &scan_bind = get.bind_data->Cast<HNSWIndexScanBindData>();
+			auto group_col_physical = scan_bind.group_column;
+			auto group_col_type = duck_table.GetColumn(LogicalIndex(group_col_physical)).GetType();
+			auto fresh_stats = group_col_type.IsNumeric()
+			    ? duck_table.GetStatistics(context, group_col_physical)
+			    : nullptr;
+			if (fresh_stats) {
+				auto fresh_min_val = NumericStats::Min(*fresh_stats);
+
+				// Update the compression projection's min_val constant
+				auto &compress_proj = agg.children[0]->Cast<LogicalProjection>();
+				for (auto &expr : compress_proj.expressions) {
+					if (expr->type == ExpressionType::BOUND_FUNCTION) {
+						auto &func_expr = expr->Cast<BoundFunctionExpression>();
+						if (func_expr.function.name.find("compress") != string::npos &&
+						    func_expr.children.size() == 2 &&
+						    func_expr.children[1]->type == ExpressionType::VALUE_CONSTANT) {
+							auto &const_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
+							// Preserve the original value type (may be INT32, INT64, etc.)
+							const_expr.value = fresh_min_val.DefaultCastAs(const_expr.value.type());
+						}
+					}
+				}
+			}
+			// Clear group_stats so PERFECT_HASH_GROUP_BY recalculates from fresh stats
+			for (auto &stat : agg.group_stats) {
+				stat.reset();
+			}
+		}
+
 		// For ungrouped: replace min_by with LIST (index scan returns exactly K results)
 		// For grouped: keep min_by (per-group ACORN-1 search handles the filtering,
 		//              min_by selects top-K per group from the per-group results)
@@ -266,6 +305,49 @@ public:
 		return true;
 	}
 
+	// Update decompress projections above grouped HNSW aggregates
+	// to use fresh min_val from the current table statistics.
+	static void FixDecompressProjections(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+		if (plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &proj = plan->Cast<LogicalProjection>();
+			for (auto &expr : proj.expressions) {
+				if (expr->type == ExpressionType::BOUND_FUNCTION) {
+					auto &func_expr = expr->Cast<BoundFunctionExpression>();
+					if (func_expr.function.name.find("decompress") != string::npos &&
+					    func_expr.children.size() == 2 &&
+					    func_expr.children[1]->type == ExpressionType::VALUE_CONSTANT) {
+						// Find the HNSW scan in descendants to get the fresh min_val
+						auto *child = plan.get();
+						while (child && !child->children.empty()) {
+							child = child->children[0].get();
+							if (child->type == LogicalOperatorType::LOGICAL_GET) {
+								auto &get = child->Cast<LogicalGet>();
+								if (get.function.name == "hnsw_index_scan") {
+									auto &bind_data = get.bind_data->Cast<HNSWIndexScanBindData>();
+									if (bind_data.HasGroupedSearch()) {
+										auto grp_type = bind_data.table.GetColumn(LogicalIndex(bind_data.group_column)).GetType();
+										auto fresh_stats = grp_type.IsNumeric()
+										    ? bind_data.table.GetStatistics(context, bind_data.group_column)
+										    : nullptr;
+										if (fresh_stats) {
+											auto fresh_min_val = NumericStats::Min(*fresh_stats);
+											auto &const_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
+											const_expr.value = fresh_min_val.DefaultCastAs(const_expr.value.type());
+										}
+									}
+								}
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+		for (auto &child : plan->children) {
+			FixDecompressProjections(context, child);
+		}
+	}
+
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 		if (!TryOptimize(input.optimizer.binder, input.context, plan)) {
 			// Recursively optimize the children
@@ -273,6 +355,8 @@ public:
 				Optimize(input, child);
 			}
 		}
+		// After optimization, fix decompress projections with fresh statistics
+		FixDecompressProjections(input.context, plan);
 	}
 };
 

@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -97,10 +98,20 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		auto group_col_storage_id = duck_table_entry.GetColumn(
 		    LogicalIndex(bind_data.group_column)).StorageOid();
 
-		// Scan the group column + ROW_ID to build per-group bitsets
+		// Scan the group column + any filter columns + ROW_ID to build per-group bitsets
 		vector<StorageIndex> group_scan_col_ids = {StorageIndex(group_col_storage_id)};
 		vector<LogicalType> group_scan_types = {
 		    duck_table_entry.GetColumn(LogicalIndex(bind_data.group_column)).GetType()};
+
+		// Add filter columns (from pushed-down WHERE predicates)
+		idx_t filter_col_start = group_scan_col_ids.size();
+		for (idx_t i = 0; i < bind_data.filter_scan_column_ids.size(); i++) {
+			group_scan_col_ids.push_back(bind_data.filter_scan_column_ids[i]);
+			group_scan_types.push_back(bind_data.filter_scan_types[i]);
+		}
+
+		// ROW_ID is always last
+		idx_t rid_col_idx = group_scan_col_ids.size();
 		group_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 		group_scan_types.push_back(LogicalType::ROW_TYPE);
 
@@ -110,8 +121,12 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 
 		auto total_rows = data_table.GetTotalRows();
 
-		// Build per-group row_id sets (group_value → list of row_ids)
-		unordered_map<int64_t, vector<idx_t>> group_row_ids;
+		// Build per-group row_id sets. We use the row_id as the group key
+		// since group values can be any type. Map: group_key → list of row_ids.
+		// We partition by hash of the group value for type-agnostic grouping.
+		vector<vector<idx_t>> group_list; // ordered list of groups
+		unordered_map<string, idx_t> group_value_to_idx; // serialized value → group index
+
 		DataChunk group_chunk;
 		group_chunk.Initialize(context, group_scan_types);
 		while (true) {
@@ -121,16 +136,64 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 				break;
 			}
 			group_chunk.Flatten();
-			auto group_data = FlatVector::GetData<int64_t>(group_chunk.data[0]);
-			auto rid_data = FlatVector::GetData<row_t>(group_chunk.data[1]);
+
+			auto rid_data = FlatVector::GetData<row_t>(group_chunk.data[rid_col_idx]);
 			for (idx_t i = 0; i < group_chunk.size(); i++) {
-				group_row_ids[group_data[i]].push_back(static_cast<idx_t>(rid_data[i]));
+				// Apply pushed-down filters (WHERE predicates) to exclude non-matching rows
+				bool passes_filters = true;
+				if (!bind_data.table_filters.filters.empty()) {
+					for (auto &filter_entry : bind_data.table_filters.filters) {
+						auto filter_col = filter_col_start + filter_entry.first;
+						auto val = group_chunk.data[filter_col].GetValue(i);
+						auto &tf = *filter_entry.second;
+						if (tf.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+							auto &cf = tf.Cast<ConstantFilter>();
+							auto cmp = val.DefaultCastAs(cf.constant.type());
+							switch (cf.comparison_type) {
+							case ExpressionType::COMPARE_EQUAL:
+								passes_filters = !cmp.IsNull() && cmp == cf.constant;
+								break;
+							case ExpressionType::COMPARE_GREATERTHAN:
+								passes_filters = !cmp.IsNull() && cmp > cf.constant;
+								break;
+							case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+								passes_filters = !cmp.IsNull() && cmp >= cf.constant;
+								break;
+							case ExpressionType::COMPARE_LESSTHAN:
+								passes_filters = !cmp.IsNull() && cmp < cf.constant;
+								break;
+							case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+								passes_filters = !cmp.IsNull() && cmp <= cf.constant;
+								break;
+							default:
+								break;
+							}
+						} else if (tf.filter_type == TableFilterType::IS_NOT_NULL) {
+							passes_filters = !val.IsNull();
+						} else if (tf.filter_type == TableFilterType::IS_NULL) {
+							passes_filters = val.IsNull();
+						}
+						if (!passes_filters) break;
+					}
+				}
+				if (!passes_filters) continue;
+				auto group_val = group_chunk.data[0].GetValue(i).ToString();
+				auto it = group_value_to_idx.find(group_val);
+				idx_t grp_idx;
+				if (it == group_value_to_idx.end()) {
+					grp_idx = group_list.size();
+					group_value_to_idx[group_val] = grp_idx;
+					group_list.emplace_back();
+				} else {
+					grp_idx = it->second;
+				}
+				group_list[grp_idx].push_back(static_cast<idx_t>(rid_data[i]));
 			}
 		}
 
 		// Run per-group filtered search and collect all row_ids
 		vector<row_t> all_result_row_ids;
-		for (auto &[group_val, row_ids] : group_row_ids) {
+		for (auto &row_ids : group_list) {
 			// Build bitset for this group
 			vector<uint64_t> group_bitset((total_rows / 64) + 1, 0);
 			for (auto rid : row_ids) {
