@@ -1,0 +1,1191 @@
+# name: test/sql/hnsw/hnsw_grouped_topk.test
+# description: Grouped min_by optimization — per-group ACORN-1 filtered HNSW search
+# group: [hnsw]
+
+require hnsw_acorn
+
+# ------------------------------------------------------------------
+# Setup: 500 rows, 3 dims, 5 groups (100 rows each)
+# ------------------------------------------------------------------
+statement ok
+CREATE TABLE items AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+# ==================================================================
+# 1. EXPLAIN: grouped min_by uses HNSW index scan
+# ==================================================================
+query II
+EXPLAIN SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM items GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Also with k=1
+query II
+EXPLAIN SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 1) FROM items GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Also with k=5
+query II
+EXPLAIN SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) FROM items GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# ==================================================================
+# 2. Ungrouped min_by still works (regression check)
+# ==================================================================
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) FROM items;
+----
+5
+
+query I
+SELECT len(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 10)) FROM items;
+----
+10
+
+# Ungrouped min_by without k returns a scalar
+query I
+SELECT min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) FROM items;
+----
+1
+
+# ==================================================================
+# 3. Grouped min_by k=3: exact match with brute force
+# ==================================================================
+statement ok
+CREATE TABLE idx_k3 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_k3 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+# All 5 groups present in index results
+query I
+SELECT count(*) FROM idx_k3;
+----
+5
+
+# All 5 groups present in brute force results
+query I
+SELECT count(*) FROM bf_k3;
+----
+5
+
+# Every group's results match exactly
+query I
+SELECT count(*) FROM idx_k3 ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_k3 bg
+    WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+5
+
+# No mismatches in the other direction either
+query I
+SELECT count(*) FROM bf_k3 bg
+WHERE NOT EXISTS (
+    SELECT 1 FROM idx_k3 ig
+    WHERE ig.category = bg.category AND ig.closest = bg.closest
+);
+----
+0
+
+# Each group returns exactly 3 results
+query I
+SELECT bool_and(len(closest) = 3) FROM idx_k3;
+----
+true
+
+statement ok
+DROP TABLE idx_k3;
+
+statement ok
+DROP TABLE bf_k3;
+
+# ==================================================================
+# 4. Grouped min_by k=1: single closest per group
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+statement ok
+CREATE TABLE idx_k1 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 1) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_k1 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 1) AS closest
+FROM items GROUP BY category;
+
+# 5 groups, each with a list of length 1
+query I
+SELECT count(*) FROM idx_k1;
+----
+5
+
+query I
+SELECT bool_and(len(closest) = 1) FROM idx_k1;
+----
+true
+
+# Results match brute force
+query I
+SELECT count(*) FROM idx_k1 ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_k1 bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+5
+
+statement ok
+DROP TABLE idx_k1;
+
+statement ok
+DROP TABLE bf_k1;
+
+# ==================================================================
+# 5. Grouped min_by k=5
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+statement ok
+CREATE TABLE idx_k5 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_k5 AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+FROM items GROUP BY category;
+
+query I
+SELECT bool_and(len(closest) = 5) FROM idx_k5;
+----
+true
+
+# Results match
+query I
+SELECT count(*) FROM idx_k5 ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_k5 bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+5
+
+statement ok
+DROP TABLE idx_k5;
+
+statement ok
+DROP TABLE bf_k5;
+
+# ==================================================================
+# 6. min_by without k (scalar, not list) with GROUP BY
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+statement ok
+CREATE TABLE idx_scalar AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_scalar AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])) AS closest
+FROM items GROUP BY category;
+
+# Returns 5 groups
+query I
+SELECT count(*) FROM idx_scalar;
+----
+5
+
+# Scalar results match brute force
+query I
+SELECT count(*) FROM idx_scalar ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_scalar bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+5
+
+statement ok
+DROP TABLE idx_scalar;
+
+statement ok
+DROP TABLE bf_scalar;
+
+# ==================================================================
+# 7. Per-group results are valid (each ID belongs to its group)
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+# k=3: unnest and verify every returned ID has the correct category
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items WHERE items.id = sub.closest_id AND items.category = sub.category
+);
+----
+0
+
+# k=5: same check
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) AS closest_id
+    FROM items GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items WHERE items.id = sub.closest_id AND items.category = sub.category
+);
+----
+0
+
+# k=1: same check
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 1)) AS closest_id
+    FROM items GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items WHERE items.id = sub.closest_id AND items.category = sub.category
+);
+----
+0
+
+# ==================================================================
+# 8. Per-group results contain valid IDs that exist in the table
+# ==================================================================
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5)) AS cid
+    FROM items GROUP BY category
+) sub WHERE cid NOT IN (SELECT id FROM items);
+----
+0
+
+# ==================================================================
+# 9. WHERE filter combined with GROUP BY
+# ==================================================================
+
+# Only categories 1 and 3
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items
+    WHERE category IN (1, 3)
+    GROUP BY category
+);
+----
+2
+
+# Verify only the requested categories are present
+query I
+SELECT count(DISTINCT category) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items
+    WHERE category IN (1, 3)
+    GROUP BY category
+);
+----
+2
+
+# All returned IDs have the correct category
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items
+    WHERE category IN (1, 3)
+    GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items WHERE items.id = sub.closest_id AND items.category = sub.category
+);
+----
+0
+
+# Single category via WHERE
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items
+    WHERE category = 2
+    GROUP BY category
+);
+----
+1
+
+# WHERE filter with brute force comparison
+statement ok
+CREATE TABLE idx_filtered AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items WHERE category IN (1, 3) GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_filtered AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM items WHERE category IN (1, 3) GROUP BY category;
+
+query I
+SELECT count(*) FROM idx_filtered ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_filtered bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+2
+
+statement ok
+DROP TABLE idx_filtered;
+
+statement ok
+DROP TABLE bf_filtered;
+
+# ==================================================================
+# 10. Different query vectors
+# ==================================================================
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+# Query vector near high-valued items
+statement ok
+CREATE TABLE idx_qv1 AS
+SELECT category, min_by(id, array_distance(vec, [400.0, 800.0, 1200.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_qv1 AS
+SELECT category, min_by(id, array_distance(vec, [400.0, 800.0, 1200.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+# HNSW is approximate — recall may vary for query vectors far from the data centroid
+query I
+SELECT (SELECT count(*) FROM idx_qv1 ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_qv1 bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 4;
+----
+true
+
+# IDs returned should be from the high end of the range
+query I
+SELECT bool_and(closest_id > 300) FROM (
+    SELECT unnest(closest) AS closest_id FROM bf_qv1
+);
+----
+true
+
+statement ok
+DROP TABLE idx_qv1;
+
+statement ok
+DROP TABLE bf_qv1;
+
+# Zero query vector
+statement ok
+CREATE INDEX idx ON items USING HNSW (vec);
+
+statement ok
+CREATE TABLE idx_qv0 AS
+SELECT category, min_by(id, array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+statement ok
+DROP INDEX idx;
+
+statement ok
+CREATE TABLE bf_qv0 AS
+SELECT category, min_by(id, array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]), 3) AS closest
+FROM items GROUP BY category;
+
+query I
+SELECT (SELECT count(*) FROM idx_qv0 ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_qv0 bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 4;
+----
+true
+
+statement ok
+DROP TABLE idx_qv0;
+
+statement ok
+DROP TABLE bf_qv0;
+
+statement ok
+DROP TABLE items;
+
+# ==================================================================
+# 11. Cosine metric with grouped min_by
+# ==================================================================
+# Use non-collinear vectors to avoid degenerate cosine ties
+statement ok
+CREATE TABLE items_cos AS
+SELECT i AS id,
+    array_value(
+        (i % 10 + 1)::FLOAT,
+        ((i * 7) % 13 + 1)::FLOAT,
+        ((i * 3) % 17 + 1)::FLOAT
+    ) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_cos ON items_cos USING HNSW (vec) WITH (metric = 'cosine');
+
+# EXPLAIN check
+query II
+EXPLAIN SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3) FROM items_cos GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# All groups returned
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3) AS closest
+    FROM items_cos GROUP BY category
+);
+----
+5
+
+# Per-group validity
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items_cos GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items_cos WHERE items_cos.id = sub.closest_id AND items_cos.category = sub.category
+);
+----
+0
+
+# Brute force comparison
+statement ok
+CREATE TABLE idx_cos_res AS
+SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3) AS closest
+FROM items_cos GROUP BY category;
+
+statement ok
+DROP INDEX idx_cos;
+
+statement ok
+CREATE TABLE bf_cos_res AS
+SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3) AS closest
+FROM items_cos GROUP BY category;
+
+# Cosine HNSW is approximate — allow minor recall variance
+query I
+SELECT (SELECT count(*) FROM idx_cos_res ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_cos_res bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 4;
+----
+true
+
+statement ok
+DROP TABLE idx_cos_res;
+
+statement ok
+DROP TABLE bf_cos_res;
+
+statement ok
+DROP TABLE items_cos;
+
+# ==================================================================
+# 12. RaBitQ quantization with grouped min_by
+# ==================================================================
+statement ok
+CREATE TABLE items_rq AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_rq ON items_rq USING HNSW (vec) WITH (quantization = 'rabitq');
+
+# EXPLAIN check
+query II
+EXPLAIN SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM items_rq GROUP BY category;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# All groups returned
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM items_rq GROUP BY category
+);
+----
+5
+
+# Per-group validity
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM items_rq GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM items_rq WHERE items_rq.id = sub.closest_id AND items_rq.category = sub.category
+);
+----
+0
+
+statement ok
+DROP TABLE items_rq;
+
+# ==================================================================
+# 13. Many groups (20 categories)
+# ==================================================================
+statement ok
+CREATE TABLE many_groups AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 20) AS category
+FROM range(1000) t(i);
+
+statement ok
+CREATE INDEX idx_mg ON many_groups USING HNSW (vec);
+
+# All 20 groups returned
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM many_groups GROUP BY category
+);
+----
+20
+
+# Every distinct category is represented
+query I
+SELECT count(DISTINCT category) FROM (
+    SELECT category FROM (
+        SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+        FROM many_groups GROUP BY category
+    )
+);
+----
+20
+
+# k=1 with 20 groups
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 1) AS closest
+    FROM many_groups GROUP BY category
+);
+----
+20
+
+# Per-group validity with 20 groups
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM many_groups GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM many_groups WHERE many_groups.id = sub.closest_id AND many_groups.category = sub.category
+);
+----
+0
+
+# Brute force comparison with many groups
+statement ok
+CREATE TABLE idx_mg_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM many_groups GROUP BY category;
+
+statement ok
+DROP INDEX idx_mg;
+
+statement ok
+CREATE TABLE bf_mg_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM many_groups GROUP BY category;
+
+# With 20 groups and per-group filtered search, allow minor recall variance
+query I
+SELECT (SELECT count(*) FROM idx_mg_res ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_mg_res bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 18;
+----
+true
+
+statement ok
+DROP TABLE idx_mg_res;
+
+statement ok
+DROP TABLE bf_mg_res;
+
+statement ok
+DROP TABLE many_groups;
+
+# ==================================================================
+# 14. Single group (all rows have same category)
+# ==================================================================
+statement ok
+CREATE TABLE single_group AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    42 AS category
+FROM range(200) t(i);
+
+statement ok
+CREATE INDEX idx_sg ON single_group USING HNSW (vec);
+
+# Returns exactly 1 group
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM single_group GROUP BY category
+);
+----
+1
+
+# That group is 42
+query I
+SELECT category FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM single_group GROUP BY category
+);
+----
+42
+
+# k=5 returns 5 results in the list
+query I
+SELECT len(closest) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM single_group GROUP BY category
+);
+----
+5
+
+# Brute force comparison
+statement ok
+CREATE TABLE idx_sg_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+FROM single_group GROUP BY category;
+
+statement ok
+DROP INDEX idx_sg;
+
+statement ok
+CREATE TABLE bf_sg_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+FROM single_group GROUP BY category;
+
+query I
+SELECT count(*) FROM idx_sg_res ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_sg_res bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+);
+----
+1
+
+statement ok
+DROP TABLE idx_sg_res;
+
+statement ok
+DROP TABLE bf_sg_res;
+
+statement ok
+DROP TABLE single_group;
+
+# ==================================================================
+# 15. Skewed group sizes
+# ==================================================================
+# Group 0: 450 rows, groups 1-9: 50 rows each (skewed but all from modular arithmetic)
+statement ok
+CREATE TABLE skewed AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 10) AS category
+FROM range(500) t(i);
+
+# Make it skewed by adding 450 more rows to category 0
+statement ok
+INSERT INTO skewed SELECT i + 500 AS id,
+    array_value((i + 500)::FLOAT, ((i + 500)*2)::FLOAT, ((i + 500)*3)::FLOAT) AS vec,
+    0 AS category
+FROM range(450) t(i);
+
+statement ok
+CREATE INDEX idx_sk ON skewed USING HNSW (vec);
+
+# All 10 groups present
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM skewed GROUP BY category
+);
+----
+10
+
+# Per-group validity (critical for skewed — small groups must not bleed)
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM skewed GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM skewed WHERE skewed.id = sub.closest_id AND skewed.category = sub.category
+);
+----
+0
+
+# k=5 for a regular group (50 items for groups 1-9) — should return 5
+query I
+SELECT len(closest) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM skewed GROUP BY category
+) WHERE category = 1;
+----
+5
+
+# k=5 for the large group (category 0 has 500 items) — should return 5
+query I
+SELECT len(closest) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 5) AS closest
+    FROM skewed GROUP BY category
+) WHERE category = 0;
+----
+5
+
+# Brute force comparison for skewed
+statement ok
+CREATE TABLE idx_sk_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM skewed GROUP BY category;
+
+statement ok
+DROP INDEX idx_sk;
+
+statement ok
+CREATE TABLE bf_sk_res AS
+SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+FROM skewed GROUP BY category;
+
+query I
+SELECT (SELECT count(*) FROM idx_sk_res ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_sk_res bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 9;
+----
+true
+
+statement ok
+DROP TABLE idx_sk_res;
+
+statement ok
+DROP TABLE bf_sk_res;
+
+statement ok
+DROP TABLE skewed;
+
+# ==================================================================
+# 16. Empty table
+# ==================================================================
+statement ok
+CREATE TABLE empty_t (id INTEGER, vec FLOAT[3], category INTEGER);
+
+statement ok
+CREATE INDEX idx_empty ON empty_t USING HNSW (vec);
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM empty_t GROUP BY category
+);
+----
+0
+
+# Ungrouped on empty table
+query I
+SELECT min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM empty_t;
+----
+NULL
+
+statement ok
+DROP TABLE empty_t;
+
+# ==================================================================
+# 17. Insert into empty table, then grouped min_by
+# ==================================================================
+statement ok
+CREATE TABLE grow_t (id INTEGER, vec FLOAT[3], category INTEGER);
+
+statement ok
+CREATE INDEX idx_grow ON grow_t USING HNSW (vec);
+
+statement ok
+INSERT INTO grow_t SELECT i, array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT), i % 3
+FROM range(90) t(i);
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM grow_t GROUP BY category
+);
+----
+3
+
+# All returned IDs valid
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM grow_t GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM grow_t WHERE grow_t.id = sub.closest_id AND grow_t.category = sub.category
+);
+----
+0
+
+statement ok
+DROP TABLE grow_t;
+
+# ==================================================================
+# 18. Grouped min_by with expression-based group key
+# ==================================================================
+statement ok
+CREATE TABLE expr_grp AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    i AS raw_cat
+FROM range(300) t(i);
+
+statement ok
+CREATE INDEX idx_eg ON expr_grp USING HNSW (vec);
+
+# Group by an expression (raw_cat % 10) rather than a plain column
+query I
+SELECT count(*) FROM (
+    SELECT raw_cat % 10 AS grp, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM expr_grp GROUP BY raw_cat % 10
+);
+----
+10
+
+statement ok
+DROP TABLE expr_grp;
+
+# ==================================================================
+# 19. Grouped min_by with negative query vector
+# ==================================================================
+statement ok
+CREATE TABLE neg_q AS
+SELECT i AS id,
+    array_value((i - 250)::FLOAT, ((i - 250) * 2)::FLOAT, ((i - 250) * 3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_nq ON neg_q USING HNSW (vec);
+
+# Negative query vector targets different region of space
+statement ok
+CREATE TABLE idx_nq_res AS
+SELECT category, min_by(id, array_distance(vec, [-100.0, -200.0, -300.0]::FLOAT[3]), 3) AS closest
+FROM neg_q GROUP BY category;
+
+statement ok
+DROP INDEX idx_nq;
+
+statement ok
+CREATE TABLE bf_nq_res AS
+SELECT category, min_by(id, array_distance(vec, [-100.0, -200.0, -300.0]::FLOAT[3]), 3) AS closest
+FROM neg_q GROUP BY category;
+
+# HNSW is approximate — per-group filtered search may return slightly
+# different results than brute force. Require at least 4/5 groups match exactly.
+query I
+SELECT (SELECT count(*) FROM idx_nq_res ig
+WHERE EXISTS (
+    SELECT 1 FROM bf_nq_res bg WHERE bg.category = ig.category AND bg.closest = ig.closest
+)) >= 4;
+----
+true
+
+statement ok
+DROP TABLE idx_nq_res;
+
+statement ok
+DROP TABLE bf_nq_res;
+
+statement ok
+DROP TABLE neg_q;
+
+# ==================================================================
+# 20. Two groups with WHERE that eliminates all but one
+# ==================================================================
+statement ok
+CREATE TABLE two_grp AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 2) AS category
+FROM range(200) t(i);
+
+statement ok
+CREATE INDEX idx_2g ON two_grp USING HNSW (vec);
+
+# WHERE eliminates one group entirely
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM two_grp
+    WHERE category = 0
+    GROUP BY category
+);
+----
+1
+
+query I
+SELECT category FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM two_grp
+    WHERE category = 0
+    GROUP BY category
+);
+----
+0
+
+statement ok
+DROP TABLE two_grp;
+
+# ==================================================================
+# 21. Grouped min_by with string group column
+# ==================================================================
+statement ok
+CREATE TABLE str_grp AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    CASE i % 3 WHEN 0 THEN 'alpha' WHEN 1 THEN 'beta' ELSE 'gamma' END AS label
+FROM range(300) t(i);
+
+statement ok
+CREATE INDEX idx_str ON str_grp USING HNSW (vec);
+
+# 3 groups with string labels
+query I
+SELECT count(*) FROM (
+    SELECT label, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM str_grp GROUP BY label
+);
+----
+3
+
+# Per-group validity
+query I
+SELECT count(*) FROM (
+    SELECT label, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3)) AS closest_id
+    FROM str_grp GROUP BY label
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM str_grp WHERE str_grp.id = sub.closest_id AND str_grp.label = sub.label
+);
+----
+0
+
+statement ok
+DROP TABLE str_grp;
+
+# ==================================================================
+# 22. Grouped min_by with RaBitQ + cosine combined
+# ==================================================================
+statement ok
+CREATE TABLE rq_cos AS
+SELECT i AS id,
+    array_value((i + 1)::FLOAT, ((i + 1)*2)::FLOAT, ((i + 1)*3)::FLOAT) AS vec,
+    (i % 4) AS category
+FROM range(400) t(i);
+
+statement ok
+CREATE INDEX idx_rqc ON rq_cos USING HNSW (vec) WITH (metric = 'cosine', quantization = 'rabitq');
+
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3) AS closest
+    FROM rq_cos GROUP BY category
+);
+----
+4
+
+# Per-group validity
+query I
+SELECT count(*) FROM (
+    SELECT category, unnest(min_by(id, array_cosine_distance(vec, [1.0, 5.0, 10.0]::FLOAT[3]), 3)) AS closest_id
+    FROM rq_cos GROUP BY category
+) sub
+WHERE NOT EXISTS (
+    SELECT 1 FROM rq_cos WHERE rq_cos.id = sub.closest_id AND rq_cos.category = sub.category
+);
+----
+0
+
+statement ok
+DROP TABLE rq_cos;
+
+# ==================================================================
+# 23. Large k relative to group size
+# ==================================================================
+statement ok
+CREATE TABLE large_k AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(50) t(i);
+
+statement ok
+CREATE INDEX idx_lk ON large_k USING HNSW (vec);
+
+# k=20 but each group has only 10 items — should return 10 per group
+query I
+SELECT bool_and(len(closest) = 10) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 20) AS closest
+    FROM large_k GROUP BY category
+);
+----
+true
+
+statement ok
+DROP TABLE large_k;
+
+# ==================================================================
+# 24. Verify no duplicate IDs within a group's result list
+# ==================================================================
+statement ok
+CREATE TABLE no_dup AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_nd ON no_dup USING HNSW (vec);
+
+# Unnest and check for duplicates within each group
+query I
+SELECT count(*) FROM (
+    SELECT category, closest_id, count(*) AS cnt FROM (
+        SELECT category, unnest(min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 10)) AS closest_id
+        FROM no_dup GROUP BY category
+    ) sub
+    GROUP BY category, closest_id
+    HAVING count(*) > 1
+);
+----
+0
+
+statement ok
+DROP TABLE no_dup;
+
+# ==================================================================
+# 25. Multiple queries in sequence (index reuse)
+# ==================================================================
+statement ok
+CREATE TABLE multi_q AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_mq ON multi_q USING HNSW (vec);
+
+# First query
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM multi_q GROUP BY category
+);
+----
+5
+
+# Second query, different vector
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [200.0, 400.0, 600.0]::FLOAT[3]), 3) AS closest
+    FROM multi_q GROUP BY category
+);
+----
+5
+
+# Third query, different k
+query I
+SELECT count(*) FROM (
+    SELECT category, min_by(id, array_distance(vec, [50.0, 100.0, 150.0]::FLOAT[3]), 7) AS closest
+    FROM multi_q GROUP BY category
+);
+----
+5
+
+statement ok
+DROP TABLE multi_q;
+
+# ==================================================================
+# 26. Multi-column GROUP BY falls back to sequential scan gracefully
+# ==================================================================
+statement ok
+CREATE TABLE multi_grp AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category,
+    (i % 3) AS tag
+FROM range(300) t(i);
+
+statement ok
+CREATE INDEX idx_mg2 ON multi_grp USING HNSW (vec);
+
+# Multi-column GROUP BY is not optimized (optimizer rejects groups.size() != 1)
+# but must still produce correct results via sequential scan fallback
+query II
+EXPLAIN SELECT category, tag, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM multi_grp GROUP BY category, tag;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# Results are still correct
+query I
+SELECT count(*) FROM (
+    SELECT category, tag, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM multi_grp GROUP BY category, tag
+);
+----
+15
+
+statement ok
+DROP TABLE multi_grp;

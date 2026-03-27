@@ -42,10 +42,51 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 	//! Types for the filter scan columns (matching filter_scan_column_ids).
 	vector<LogicalType> filter_scan_types;
 
+	//! --- Metadata join fields (optional) ---
+	//! When set, the scan pre-executes a metadata table query to derive the
+	//! filter bitset for ACORN-1 filtered search. This implements cross-table
+	//! filtered kNN: JOIN metadata ON id WHERE metadata.col = value.
+
+	//! The metadata table to scan for matching join keys
+	optional_ptr<TableCatalogEntry> metadata_table;
+
+	//! The join key column index in the indexed (embeddings) table
+	idx_t indexed_join_column = DConstants::INVALID_INDEX;
+
+	//! The join key column index in the metadata table
+	idx_t metadata_join_column = DConstants::INVALID_INDEX;
+
+	//! Filters to apply when scanning the metadata table
+	mutable TableFilterSet metadata_filters;
+
+	//! Column IDs for the metadata filter scan
+	vector<StorageIndex> metadata_scan_column_ids;
+
+	//! Types for the metadata filter scan columns
+	vector<LogicalType> metadata_scan_types;
+
+	bool HasMetadataJoin() const {
+		return metadata_table.get() != nullptr;
+	}
+
+	//! --- Grouped TopK fields (optional) ---
+	//! When set, the scan runs per-group ACORN-1 filtered search.
+	//! For each distinct value of the group column, builds a filter bitset
+	//! and runs a separate HNSW filtered search.
+	idx_t group_column = DConstants::INVALID_INDEX;
+
+	bool HasGroupedSearch() const {
+		return group_column != DConstants::INVALID_INDEX;
+	}
+
 public:
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<HNSWIndexScanBindData>();
-		return &other.table == &table;
+		return &other.table == &table && &other.index == &index &&
+		       other.limit == limit && other.group_column == group_column &&
+		       other.indexed_join_column == indexed_join_column &&
+		       other.metadata_join_column == metadata_join_column &&
+		       other.metadata_table == metadata_table;
 	}
 
 	bool HasFilters() const {
