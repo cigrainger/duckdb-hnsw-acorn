@@ -240,6 +240,8 @@ public:
 			// Join key must be BIGINT (we read it as int64_t during scan init)
 			auto idx_join_col_type = duck_table.GetColumn(LogicalIndex(indexed_join_col)).GetType();
 			if (idx_join_col_type.id() != LogicalTypeId::BIGINT) {
+				// Silent fallback to sequential scan. Common miss: INTEGER primary keys.
+				// TODO: Support INTEGER, HUGEINT, UUID join keys via type-dispatched reads.
 				return false;
 			}
 

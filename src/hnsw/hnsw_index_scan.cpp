@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -255,8 +256,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		// keys, and build a filter bitset for ACORN-1 filtered search.
 		auto &data_table = bind_data.table.GetStorage();
 		auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
-		// const_cast needed: DuckDB's CatalogEntry returns const from Cast(), but
-		// GetStorage() requires non-const access for scan initialization.
+		// const_cast required: TableFunctionInitInput::bind_data is const, so all
+		// member access is const. But GetStorage() is non-const only (no const overload
+		// in DuckDB). This is the same pattern DuckDB uses internally for table scans.
 		auto &meta_table_entry = const_cast<DuckTableEntry &>(bind_data.metadata_table->Cast<DuckTableEntry>());
 		auto &meta_data_table = meta_table_entry.GetStorage();
 
@@ -289,7 +291,9 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			}
 		}
 
-		// Step 2: Scan the indexed table's join column + ROW_ID to find matching row_ids
+		// Step 2: Scan the indexed table's join column + ROW_ID to find matching row_ids.
+		// Use an InFilter so DuckDB's storage layer can skip segments via zone maps
+		// rather than scanning the entire table.
 		auto &idx_duck_table = bind_data.table.Cast<DuckTableEntry>();
 		auto join_col_storage_id = idx_duck_table.GetColumn(
 		    LogicalIndex(bind_data.indexed_join_column)).StorageOid();
@@ -299,9 +303,27 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		idx_scan_col_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 		idx_scan_types.push_back(LogicalType::ROW_TYPE);
 
+		// Build range filter (min <= key <= max) to enable zone map pruning.
+		// DuckDB's low-level scan API supports ConstantFilter but not InFilter,
+		// so we use a range that covers all matching keys. This lets the storage
+		// layer skip segments whose zone maps fall entirely outside the range.
+		// The per-row unordered_set lookup still rejects non-matching keys within range.
+		TableFilterSet join_key_filters;
+		if (!matching_keys.empty()) {
+			auto min_key = *std::min_element(matching_keys.begin(), matching_keys.end());
+			auto max_key = *std::max_element(matching_keys.begin(), matching_keys.end());
+			auto range = make_uniq<ConjunctionAndFilter>();
+			range->child_filters.push_back(make_uniq<ConstantFilter>(
+			    ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(min_key)));
+			range->child_filters.push_back(make_uniq<ConstantFilter>(
+			    ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::BIGINT(max_key)));
+			join_key_filters.filters[0] = std::move(range);
+		}
+
 		TableScanState idx_scan_state;
 		idx_scan_state.Initialize(idx_scan_col_ids);
-		data_table.InitializeScan(context, transaction, idx_scan_state, idx_scan_col_ids);
+		data_table.InitializeScan(context, transaction, idx_scan_state, idx_scan_col_ids,
+		                          matching_keys.empty() ? nullptr : &join_key_filters);
 
 		auto total_rows = data_table.GetTotalRows();
 		vector<uint64_t> filter_bitset((total_rows / 64) + 1, 0);
