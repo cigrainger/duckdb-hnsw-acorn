@@ -37,9 +37,21 @@ SELECT * FROM items
 WHERE category = 1
 ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
 LIMIT 10;
+
+-- Metadata join (vectors + metadata in separate tables)
+CREATE TABLE metadata AS SELECT i AS id, (i % 5) AS category, 'item_' || i AS name FROM range(10000) t(i);
+SELECT m.name FROM items JOIN metadata m ON items.id = m.id
+WHERE m.category = 2
+ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+
+-- Per-group nearest neighbors
+SELECT category,
+    min_by(id, array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]), 3)
+FROM items GROUP BY category;
 ```
 
-No special syntax — the optimizer detects `WHERE` + `ORDER BY distance` + `LIMIT` and uses filtered HNSW search automatically.
+No special syntax — the optimizer detects these patterns and uses filtered HNSW search automatically.
 
 ## RaBitQ quantization
 
@@ -124,6 +136,41 @@ SET hnsw_bruteforce_threshold = 0.01;  -- default
 | Korean only | ~1% | 0/10 | **10/10** |
 | Rating >= 8.0 | ~5% | 0/10 | **10/10** |
 
+## Metadata joins
+
+When your vectors and metadata live in separate tables, the optimizer rewrites a standard JOIN into a filtered HNSW search:
+
+```sql
+SELECT m.title, m.genre
+FROM embeddings e
+JOIN metadata m ON e.id = m.id
+WHERE m.genre = 'sci-fi'
+ORDER BY array_distance(e.vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+```
+
+The optimizer pre-scans the metadata table to find matching join keys, builds an ACORN-1 filter bitset, and runs a single filtered HNSW search. The JOIN remains in the plan to reattach metadata columns. Zone map pruning skips irrelevant segments during the key lookup.
+
+Requirements:
+- Join key must be `BIGINT`
+- The HNSW index must be on the embeddings table (not the metadata table)
+- Query must have `ORDER BY distance LIMIT k`
+
+## Grouped nearest neighbors
+
+Per-group top-K search using standard SQL aggregation:
+
+```sql
+SELECT category,
+    min_by(id, array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]), 5)
+FROM items
+GROUP BY category;
+```
+
+For each distinct group value, the optimizer builds a per-group filter bitset and runs a separate ACORN-1 filtered search. This gives exact per-group recall — no oversampling heuristic, no post-filtering.
+
+Works with any group column type (integers, strings), single-column `GROUP BY` only. Multi-column `GROUP BY` falls back to sequential scan.
+
 ## Distance metrics
 
 | Metric | Option | Function | Operator |
@@ -187,6 +234,8 @@ Indexes persist across restarts when using a disk-backed database. The full inde
 - The index must fit in RAM (not buffer-managed).
 - Subquery query vectors fall back to sequential scan — use literals or prepared statements.
 - RaBitQ with inner product metric has lower recall than L2sq or cosine (the L2sq graph proxy doesn't align well with IP ordering).
+- Metadata join requires `BIGINT` join keys. `INTEGER` or `UUID` keys silently fall back to sequential scan.
+- Grouped `min_by` supports single-column `GROUP BY` only. Multi-column groups fall back to sequential scan.
 
 ## Building
 
