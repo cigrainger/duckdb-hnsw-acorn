@@ -113,7 +113,10 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 		vector<LogicalType> group_scan_types = {
 		    duck_table_entry.GetColumn(LogicalIndex(bind_data.group_column)).GetType()};
 
-		// Add filter columns (from pushed-down WHERE predicates)
+		// Add filter columns (from pushed-down WHERE predicates).
+		// Invariant: filter_scan_column_ids and table_filters.filters are populated
+		// in the same iteration order by ExtractFiltersIntoBind, so filter_entry.first
+		// (a remapped key) maps correctly to filter_col_start + filter_entry.first.
 		idx_t filter_col_start = group_scan_col_ids.size();
 		for (idx_t i = 0; i < bind_data.filter_scan_column_ids.size(); i++) {
 			group_scan_col_ids.push_back(bind_data.filter_scan_column_ids[i]);
@@ -131,13 +134,16 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 
 		auto total_rows = data_table.GetTotalRows();
 
-		// Build per-group row_id sets using Value::ToString() as the group key.
-		// This is type-agnostic (works for integers, strings, etc.) but assumes
-		// no collisions in string representation across distinct values of the
-		// same type. This holds for all DuckDB scalar types. Performance is
-		// acceptable for moderate group cardinality (hundreds, not millions).
+		// Build per-group row_id sets.
+		// Fast path for integer types (the common case): use int64 directly.
+		// Fallback for other types: Value::ToString() as key. This assumes no
+		// collisions in string representation across distinct values of the same
+		// type, which holds for all DuckDB scalar types.
 		vector<vector<idx_t>> group_list; // ordered list of groups
-		unordered_map<string, idx_t> group_value_to_idx; // serialized value → group index
+		unordered_map<int64_t, idx_t> group_int_to_idx;
+		unordered_map<string, idx_t> group_str_to_idx;
+		auto group_type = duck_table_entry.GetColumn(LogicalIndex(bind_data.group_column)).GetType();
+		bool use_int_fast_path = group_type.IsIntegral();
 
 		DataChunk group_chunk;
 		group_chunk.Initialize(context, group_scan_types);
@@ -189,15 +195,28 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					}
 				}
 				if (!passes_filters) continue;
-				auto group_val = group_chunk.data[0].GetValue(i).ToString();
-				auto it = group_value_to_idx.find(group_val);
+
 				idx_t grp_idx;
-				if (it == group_value_to_idx.end()) {
-					grp_idx = group_list.size();
-					group_value_to_idx[group_val] = grp_idx;
-					group_list.emplace_back();
+				if (use_int_fast_path) {
+					auto key = group_chunk.data[0].GetValue(i).GetValue<int64_t>();
+					auto it = group_int_to_idx.find(key);
+					if (it == group_int_to_idx.end()) {
+						grp_idx = group_list.size();
+						group_int_to_idx[key] = grp_idx;
+						group_list.emplace_back();
+					} else {
+						grp_idx = it->second;
+					}
 				} else {
-					grp_idx = it->second;
+					auto key = group_chunk.data[0].GetValue(i).ToString();
+					auto it = group_str_to_idx.find(key);
+					if (it == group_str_to_idx.end()) {
+						grp_idx = group_list.size();
+						group_str_to_idx[key] = grp_idx;
+						group_list.emplace_back();
+					} else {
+						grp_idx = it->second;
+					}
 				}
 				group_list[grp_idx].push_back(static_cast<idx_t>(rid_data[i]));
 			}

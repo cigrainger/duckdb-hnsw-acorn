@@ -82,7 +82,11 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 public:
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<HNSWIndexScanBindData>();
-		return &other.table == &table;
+		return &other.table == &table && &other.index == &index &&
+		       other.limit == limit && other.group_column == group_column &&
+		       other.indexed_join_column == indexed_join_column &&
+		       other.metadata_join_column == metadata_join_column &&
+		       other.metadata_table == metadata_table;
 	}
 
 	bool HasFilters() const {
