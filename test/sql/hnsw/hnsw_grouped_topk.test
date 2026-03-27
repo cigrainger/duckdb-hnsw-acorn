@@ -1152,3 +1152,36 @@ SELECT count(*) FROM (
 
 statement ok
 DROP TABLE multi_q;
+
+# ==================================================================
+# 26. Multi-column GROUP BY falls back to sequential scan gracefully
+# ==================================================================
+statement ok
+CREATE TABLE multi_grp AS
+SELECT i AS id,
+    array_value(i::FLOAT, (i*2)::FLOAT, (i*3)::FLOAT) AS vec,
+    (i % 5) AS category,
+    (i % 3) AS tag
+FROM range(300) t(i);
+
+statement ok
+CREATE INDEX idx_mg2 ON multi_grp USING HNSW (vec);
+
+# Multi-column GROUP BY is not optimized (optimizer rejects groups.size() != 1)
+# but must still produce correct results via sequential scan fallback
+query II
+EXPLAIN SELECT category, tag, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) FROM multi_grp GROUP BY category, tag;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# Results are still correct
+query I
+SELECT count(*) FROM (
+    SELECT category, tag, min_by(id, array_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]), 3) AS closest
+    FROM multi_grp GROUP BY category, tag
+);
+----
+15
+
+statement ok
+DROP TABLE multi_grp;

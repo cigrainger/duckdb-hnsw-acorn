@@ -157,8 +157,18 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 			group_chunk.Flatten();
 
 			auto rid_data = FlatVector::GetData<row_t>(group_chunk.data[rid_col_idx]);
+
+			// After Flatten(), use typed data pointers to avoid per-row GetValue()
+			// virtual dispatch and allocation.
+			string_t *group_str_data = nullptr;
+			if (!use_int_fast_path && group_type.id() == LogicalTypeId::VARCHAR) {
+				group_str_data = FlatVector::GetData<string_t>(group_chunk.data[0]);
+			}
+
 			for (idx_t i = 0; i < group_chunk.size(); i++) {
-				// Apply pushed-down filters (WHERE predicates) to exclude non-matching rows
+				// Apply pushed-down filters (WHERE predicates) to exclude non-matching rows.
+				// Filter evaluation still uses GetValue() since filter columns vary in type
+				// and this path is only hit when WHERE is pushed down (uncommon for grouped agg).
 				bool passes_filters = true;
 				if (!bind_data.table_filters.filters.empty()) {
 					for (auto &filter_entry : bind_data.table_filters.filters) {
@@ -199,7 +209,20 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 
 				idx_t grp_idx;
 				if (use_int_fast_path) {
-					auto key = group_chunk.data[0].GetValue(i).GetValue<int64_t>();
+					// Read integer group key using native type to avoid GetValue() overhead.
+					// Cast to int64 for the hash map key regardless of underlying int width.
+					int64_t key;
+					auto &vec = group_chunk.data[0];
+					switch (group_type.InternalType()) {
+					case PhysicalType::INT8: key = FlatVector::GetData<int8_t>(vec)[i]; break;
+					case PhysicalType::INT16: key = FlatVector::GetData<int16_t>(vec)[i]; break;
+					case PhysicalType::INT32: key = FlatVector::GetData<int32_t>(vec)[i]; break;
+					case PhysicalType::INT64: key = FlatVector::GetData<int64_t>(vec)[i]; break;
+					case PhysicalType::UINT8: key = FlatVector::GetData<uint8_t>(vec)[i]; break;
+					case PhysicalType::UINT16: key = FlatVector::GetData<uint16_t>(vec)[i]; break;
+					case PhysicalType::UINT32: key = FlatVector::GetData<uint32_t>(vec)[i]; break;
+					default: key = group_chunk.data[0].GetValue(i).GetValue<int64_t>(); break;
+					}
 					auto it = group_int_to_idx.find(key);
 					if (it == group_int_to_idx.end()) {
 						grp_idx = group_list.size();
@@ -208,7 +231,18 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 					} else {
 						grp_idx = it->second;
 					}
+				} else if (group_str_data) {
+					auto key = group_str_data[i].GetString();
+					auto it = group_str_to_idx.find(key);
+					if (it == group_str_to_idx.end()) {
+						grp_idx = group_list.size();
+						group_str_to_idx[key] = grp_idx;
+						group_list.emplace_back();
+					} else {
+						grp_idx = it->second;
+					}
 				} else {
+					// Fallback for non-integer, non-string types
 					auto key = group_chunk.data[0].GetValue(i).ToString();
 					auto it = group_str_to_idx.find(key);
 					if (it == group_str_to_idx.end()) {

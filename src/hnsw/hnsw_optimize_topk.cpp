@@ -1,4 +1,5 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -281,7 +282,7 @@ public:
 				for (auto &expr : compress_proj.expressions) {
 					if (expr->type == ExpressionType::BOUND_FUNCTION) {
 						auto &func_expr = expr->Cast<BoundFunctionExpression>();
-						if (func_expr.function.name.find("compress") != string::npos &&
+						if (StringUtil::StartsWith(func_expr.function.name, "__internal_compress_integral_") &&
 						    func_expr.children.size() == 2 &&
 						    func_expr.children[1]->type == ExpressionType::VALUE_CONSTANT) {
 							auto &const_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
@@ -316,7 +317,7 @@ public:
 			for (auto &expr : proj.expressions) {
 				if (expr->type == ExpressionType::BOUND_FUNCTION) {
 					auto &func_expr = expr->Cast<BoundFunctionExpression>();
-					if (func_expr.function.name.find("decompress") != string::npos &&
+					if (StringUtil::StartsWith(func_expr.function.name, "__internal_decompress_integral_") &&
 					    func_expr.children.size() == 2 &&
 					    func_expr.children[1]->type == ExpressionType::VALUE_CONSTANT) {
 						// Find the HNSW scan in descendants to get the fresh min_val
