@@ -264,7 +264,7 @@ public:
 		// propagation may have used cached stats from a previously dropped table
 		// to compute compression min_val. Refresh it from the current table stats.
 		// NOTE: This patches __internal_compress_integral_* and __internal_decompress_integral_*
-		// functions by name. Coupled to DuckDB internals (tested against DuckDB v1.5.0).
+		// functions by name. Coupled to DuckDB internals (tested against DuckDB v1.5.1).
 		// If these function names change, the fix silently becomes a no-op (safe but stale).
 		if (!agg.groups.empty() && has_compression_proj) {
 			// Get fresh statistics for the group column from the current table
